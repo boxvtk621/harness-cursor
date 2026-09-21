@@ -1,0 +1,15 @@
+{
+  "name": "hl257-cursor-adapter-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "@cursor/sdk": "1.0.31"
+  },
+  "scripts": {
+    "test": "node --test worker_test.mjs"
+  }
+}

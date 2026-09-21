@@ -1,0 +1,41 @@
+name: quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out Harness Cursor
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check out pinned provenance source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: boxvtk621/homelab-telegram-panel
+          ref: d5edfb20f358bb0ce243d07840b49da8566ab0ca
+          token: ${{ secrets.HOMELAB_SOURCE_READ_TOKEN }}
+          path: .provenance-source/homelab-telegram-panel
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.5"
+          cache: true
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24.18.0"
+          cache: npm
+          cache-dependency-path: |
+            adapters/cursor/worker/package-lock.json
+            contracts/package-lock.json
+      - run: make quality SOURCE_REPO="$GITHUB_WORKSPACE/.provenance-source/homelab-telegram-panel"
+      - run: make image IMAGE=harness-cursor:ci VERSION=ci
+      - run: make container-smoke IMAGE=harness-cursor:ci
