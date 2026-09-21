@@ -1,13 +1,13 @@
 # Harness Cursor
 
-Standalone Cursor Harness node for the HomeLab Panel C1 private wire. This repository owns the Cursor adapter, durable SQLite execution authority, private mTLS API, tool sandbox helper, protocol artifacts, and the Cursor-only container image.
+Standalone Cursor Harness node for the HomeLab private wire. This repository owns the Cursor adapter, durable SQLite execution authority, private TLS API, tool sandbox helper, protocol artifacts, and the Cursor-only container image.
 
 The extraction source is `homelab-telegram-panel` commit `d5edfb20f358bb0ce243d07840b49da8566ab0ca` (base `9736f8c74e2f242cbe63dda3b0c74b42bc8d04d9`). The target repository started at `89d24811028b1ca0937894b0a4be9c05bbebb180`. [The provenance manifest](provenance/source-manifest.csv) records every considered source file, its SHA-256, destination, or explicit exclusion.
 
 ## Boundaries
 
 - The executable supports only `adapter: "cursor"`; Codex and unknown provider configuration fail closed before a provider process starts.
-- C1 schemas, fixtures, receipts, SQLite migrations, mTLS pins, fencing, versions, and recovery semantics remain compatible with the pinned source snapshot.
+- Schemas, fixtures, receipts, SQLite migrations, fencing, versions, and recovery semantics remain compatible with the pinned source snapshot; inbound client-certificate and actor authorization have been removed.
 - Panel, Router, Agent Service clients, host tunnels, Fixik, provider secrets, databases, state, and production configuration are not part of this repository.
 - There is no sibling `replace`, shared database, shared volume, or build dependency on another checkout.
 
@@ -16,7 +16,7 @@ Removing the Cursor code from the source monorepo, changing Panel deployment, pu
 ## Layout
 
 - `adapters/cursor` — Go adapter and pinned Node worker.
-- `runtime`, `api`, `contracts`, `tools` — durable node, mTLS API, C1 artifacts, and sandbox helper.
+- `runtime`, `api`, `contracts`, `tools` — durable node, private TLS API, wire artifacts, and sandbox helper.
 - `cmd/harness-node`, `cmd/harness-tool-runner` — Cursor-only executables.
 - `delivery/Dockerfile.cursor` — pinned, non-root image.
 - `provenance/source-manifest.csv` — source/destination hash inventory.
@@ -37,7 +37,7 @@ make container-smoke IMAGE=harness-cursor:local
 
 ## Runtime configuration
 
-The following creates both exact policy manifests and a complete explicit-once configuration. `gateway.crt` and `operator.crt` must be distinct client certificates signed by `ca.crt`; `server.crt`/`server.key` are the node's server identity.
+The following creates both exact policy manifests and a complete explicit-once configuration. `server.crt`/`server.key` are the node's server identity. The private listener does not request or authorize client certificates and accepts no actor header.
 
 ```sh
 mkdir -p config
@@ -46,8 +46,6 @@ printf '[]\n' >config/tools-deny.json
 printf '[{"name":"cursor.command"},{"name":"cursor.file_change"}]\n' >config/tools-explicit.json
 printf '%s' 'replace-with-real-cursor-key' >config/cursor.key
 
-GATEWAY_PIN=$(openssl x509 -in config/gateway.crt -outform DER | sha256sum | cut -d ' ' -f 1)
-OPERATOR_PIN=$(openssl x509 -in config/operator.crt -outform DER | sha256sum | cut -d ' ' -f 1)
 cat >config/node.json <<EOF
 {
   "listen": "0.0.0.0:8443",
@@ -57,9 +55,6 @@ cat >config/node.json <<EOF
   "registryVersion": 1,
   "certificateFile": "/config/server.crt",
   "keyFile": "/config/server.key",
-  "clientCAFile": "/config/ca.crt",
-  "gatewayCertificateSHA256": "$GATEWAY_PIN",
-  "operatorCertificateSHA256": "$OPERATOR_PIN",
   "policyFile": "/config/policy.txt",
   "toolManifestFile": "/config/tools-explicit.json",
   "policyRevision": "local@1",

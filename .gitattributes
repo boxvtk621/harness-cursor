@@ -1,0 +1,2 @@
+contracts/*.json text eol=lf
+delivery/*.sh text eol=lf

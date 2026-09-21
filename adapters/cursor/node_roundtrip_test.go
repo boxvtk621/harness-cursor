@@ -51,7 +51,7 @@ func TestExplicitApprovalRoundTripsOperatorVersionOneToAdapterVersionTwo(t *test
 		t.Fatal(err)
 	}
 	defer opened.Close()
-	trust := node.TrustContext{ActorID: "1-1", TransportNodeID: cursorNodeTestID, PeerVerified: true}
+	trust := node.TrustContext{TransportNodeID: cursorNodeTestID}
 
 	created := cursorNodeReceipt(t, opened.SubmitCommand(ctx, trust, cursorNodeCommand(t,
 		"11000000-0000-4000-8000-000000000001", "dialog.create",

@@ -4,11 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/hex"
 	"encoding/json"
 	"io"
 	"math/big"
@@ -37,13 +35,9 @@ func (enoughSpace) Measure(string) (node.SpaceInfo, error) {
 	return node.SpaceInfo{FreeBytes: 16 << 30, TotalBytes: 64 << 30}, nil
 }
 
-func TestRealMTLSCommandsAndReads(t *testing.T) {
+func TestRealTLSCommandsAndReadsWithoutInboundAuthorization(t *testing.T) {
 	ca, caKey, caPool := certificateAuthority(t)
 	serverCertificate, _ := signedCertificate(t, ca, caKey, "localhost", false)
-	clientCertificate, clientLeaf := signedCertificate(t, ca, caKey, "gateway", true)
-	operatorCertificate, operatorLeaf := signedCertificate(t, ca, caKey, "operator", true)
-	digest := sha256.Sum256(clientLeaf.Raw)
-	operatorDigest := sha256.Sum256(operatorLeaf.Raw)
 	authority, err := node.Open(context.Background(), node.Config{
 		DataDir: t.TempDir(), NodeID: testNodeID, OwnerID: "1-1", RegistryVersion: 1,
 		Adapter: fixture.NewAdapter(), Policies: fixture.NewPolicySource(), Space: enoughSpace{}, ManualDispatchForTesting: true,
@@ -52,26 +46,20 @@ func TestRealMTLSCommandsAndReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer authority.Close()
-	handler, err := server.New(server.Config{
-		NodeID: testNodeID, GatewayCertificateSHA256: hex.EncodeToString(digest[:]),
-		OperatorCertificateSHA256: hex.EncodeToString(operatorDigest[:]),
-	}, authority)
+	handler, err := server.New(server.Config{NodeID: testNodeID}, authority)
 	if err != nil {
 		t.Fatal(err)
 	}
 	endpoint := httptest.NewUnstartedServer(handler)
 	endpoint.TLS = &tls.Config{
-		Certificates: []tls.Certificate{serverCertificate}, ClientAuth: tls.RequireAndVerifyClientCert,
-		ClientCAs: caPool, MinVersion: tls.VersionTLS13,
+		Certificates: []tls.Certificate{serverCertificate}, MinVersion: tls.VersionTLS13,
 	}
 	endpoint.StartTLS()
 	defer endpoint.Close()
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
-		RootCAs: caPool, Certificates: []tls.Certificate{clientCertificate}, ServerName: "localhost", MinVersion: tls.VersionTLS13,
+		RootCAs: caPool, ServerName: "localhost", MinVersion: tls.VersionTLS13,
 	}}}
-	operatorClient := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
-		RootCAs: caPool, Certificates: []tls.Certificate{operatorCertificate}, ServerName: "localhost", MinVersion: tls.VersionTLS13,
-	}}}
+	operatorClient := client
 
 	identity := request(t, client, http.MethodGet, endpoint.URL+"/v1/nodes/"+testNodeID+"/identity", "", "1-1")
 	validateResponse(t, identity, http.StatusOK, "nodeIdentity")
@@ -85,9 +73,11 @@ func TestRealMTLSCommandsAndReads(t *testing.T) {
 		Scope: harnessbarrier.Scope{Kind: "node"}, ExpectedScopeRevision: 0,
 	})
 	wrongRole := request(t, client, http.MethodPost, endpoint.URL+"/v1/nodes/"+testNodeID+"/administration/holds", string(holdRequest), "1-1")
-	validateResponse(t, wrongRole, http.StatusForbidden, "error")
+	if status := int(wrongRole[0])<<8 | int(wrongRole[1]); status != http.StatusCreated {
+		t.Fatalf("admin request without operator identity status=%d", status)
+	}
 	holdResponse := request(t, operatorClient, http.MethodPost, endpoint.URL+"/v1/nodes/"+testNodeID+"/administration/holds", string(holdRequest), "1-1")
-	if status := int(holdResponse[0])<<8 | int(holdResponse[1]); status != http.StatusCreated || harnessbarrier.Validate("holdReceipt", holdResponse[2:]) != nil {
+	if status := int(holdResponse[0])<<8 | int(holdResponse[1]); (status != http.StatusCreated && status != http.StatusOK) || harnessbarrier.Validate("holdReceipt", holdResponse[2:]) != nil {
 		t.Fatalf("administrative hold endpoint failed: status=%d body=%s", status, holdResponse[2:])
 	}
 	var hold harnessbarrier.HoldReceipt
@@ -118,8 +108,12 @@ func TestRealMTLSCommandsAndReads(t *testing.T) {
 	validateResponse(t, snapshot, http.StatusOK, "snapshot")
 	ready := request(t, client, http.MethodGet, endpoint.URL+"/health/ready", "", "1-1")
 	validateResponse(t, ready, http.StatusOK, "healthReady")
-	forbidden := request(t, client, http.MethodGet, endpoint.URL+"/v1/nodes/"+testNodeID+"/snapshot", "", "1-2")
-	validateResponse(t, forbidden, http.StatusForbidden, "error")
+	validateResponse(t, request(t, client, http.MethodGet, endpoint.URL+"/v1/nodes/"+testNodeID+"/snapshot", "", "1-2"), http.StatusOK, "snapshot")
+	validateResponse(t, request(t, client, http.MethodGet, endpoint.URL+"/v1/identity", "", ""), http.StatusOK, "nodeIdentity")
+	if heartbeat := request(t, client, http.MethodGet, endpoint.URL+"/v1/executor/heartbeat", "", ""); int(heartbeat[0])<<8|int(heartbeat[1]) != http.StatusOK {
+		t.Fatalf("heartbeat failed: %s", heartbeat[2:])
+	}
+	validateResponse(t, request(t, client, http.MethodGet, endpoint.URL+"/v1/nodes/10000000-0000-4000-8000-000000000000/snapshot", "", ""), http.StatusNotFound, "error")
 
 	var createReceipt harnessprotocol.Receipt
 	if err := json.Unmarshal(accepted[2:], &createReceipt); err != nil {
@@ -147,7 +141,7 @@ func TestRealMTLSCommandsAndReads(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		var current harnessprotocol.Snapshot
-		result := authority.Snapshot(context.Background(), node.TrustContext{ActorID: "1-1", TransportNodeID: testNodeID, PeerVerified: true})
+		result := authority.Snapshot(context.Background(), node.TrustContext{TransportNodeID: testNodeID})
 		if result.HTTPStatus == 200 && json.Unmarshal(result.Body, &current) == nil && current.ActiveAttempt != nil && current.ActiveAttempt.State == "running" {
 			break
 		}
@@ -190,7 +184,6 @@ func TestRealMTLSCommandsAndReads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	chunkRequest.Header.Set(server.DefaultActorHeader, "1-1")
 	chunkResponse, err := client.Do(chunkRequest)
 	if err != nil {
 		t.Fatal(err)
@@ -209,14 +202,21 @@ func TestRealMTLSCommandsAndReads(t *testing.T) {
 	validateResponse(t, request(t, client, http.MethodGet, endpoint.URL+"/v1/nodes/"+testNodeID+"/texts/"+manifest.TextID+"/chunks/0?"+wrongChunkQuery, "", "1-1"), http.StatusNotFound, "error")
 	invalidQuery := strings.Replace(query, "sourceStream=none", "sourceStream=stdout", 1)
 	validateResponse(t, request(t, client, http.MethodGet, endpoint.URL+"/v1/nodes/"+testNodeID+"/texts/resolve?"+invalidQuery, "", "1-1"), http.StatusBadRequest, "error")
-	validateResponse(t, request(t, client, http.MethodGet, endpoint.URL+"/v1/nodes/"+testNodeID+"/texts/resolve?"+query, "", "1-2"), http.StatusForbidden, "error")
+	foreignActorResolved := request(t, client, http.MethodGet, endpoint.URL+"/v1/nodes/"+testNodeID+"/texts/resolve?"+query, "", "1-2")
+	if status := int(foreignActorResolved[0])<<8 | int(foreignActorResolved[1]); status != http.StatusOK {
+		t.Fatalf("safe text without actor authorization status=%d body=%s", status, foreignActorResolved[2:])
+	}
+	if _, err := transcriptview.Decode(foreignActorResolved[2:]); err != nil {
+		t.Fatalf("safe text without actor authorization is invalid: %v", err)
+	}
 
 	withoutCertificate := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: caPool, ServerName: "localhost", MinVersion: tls.VersionTLS13}}}
 	requestValue, _ := http.NewRequest(http.MethodGet, endpoint.URL+"/health/live", nil)
-	requestValue.Header.Set(server.DefaultActorHeader, "1-1")
-	if _, err := withoutCertificate.Do(requestValue); err == nil {
-		t.Fatal("listener accepted a client without mTLS certificate")
+	response, err := withoutCertificate.Do(requestValue)
+	if err != nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("unauthenticated private request rejected: status=%v err=%v", response, err)
 	}
+	response.Body.Close()
 }
 
 func request(t *testing.T, client *http.Client, method, url, body, actor string) []byte {
@@ -229,7 +229,6 @@ func requestExpected(t *testing.T, client *http.Client, method, url, body, actor
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.Header.Set(server.DefaultActorHeader, actor)
 	if expected != nil {
 		request.Header.Set(harnessprotocol.ExpectedNodeIDHeader, expected.NodeID)
 		request.Header.Set(harnessprotocol.ExpectedRegistryHeader, strconv.FormatInt(expected.RegistryVersion, 10))

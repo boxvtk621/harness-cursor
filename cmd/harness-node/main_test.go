@@ -74,6 +74,29 @@ func TestProviderValidationFailsClosedForMissingOrUnknownSelector(t *testing.T) 
 	}
 }
 
+func TestManualDispatchIsRestrictedToHL304Fixture(t *testing.T) {
+	valid := config{
+		Adapter: "cursor", Cursor: &cursorConfig{Model: "fixture-no-provider-call"},
+		PolicyRevision: "hl304-fixture@1", ApprovalMode: "deny", ManualDispatchForTesting: true,
+	}
+	if err := validateProviderConfig(valid); err != nil {
+		t.Fatalf("exact fixture configuration rejected: %v", err)
+	}
+	for _, mutate := range []func(*config){
+		func(cfg *config) { cfg.PolicyRevision = "production@1" },
+		func(cfg *config) { cfg.ApprovalMode = "explicit_once" },
+		func(cfg *config) { cfg.Cursor.Model = "real-model" },
+	} {
+		candidate := valid
+		cursor := *valid.Cursor
+		candidate.Cursor = &cursor
+		mutate(&candidate)
+		if err := validateProviderConfig(candidate); err == nil {
+			t.Fatal("unsafe manual-dispatch configuration was accepted")
+		}
+	}
+}
+
 func TestExplicitToolWorkspaceIsPinned(t *testing.T) {
 	for _, test := range []struct {
 		name, workingDir string
