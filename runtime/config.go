@@ -13,6 +13,7 @@ import (
 
 	"github.com/boxvtk621/harness-cursor/adapters/contract"
 	"github.com/boxvtk621/harness-cursor/contracts/wire"
+	"github.com/boxvtk621/harness-cursor/providerauth"
 )
 
 var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
@@ -66,6 +67,7 @@ type Config struct {
 	Space           SpaceProbe
 	StartupFault    func(StartupPoint) error
 	Artifacts       *ArtifactIngress
+	ProviderAuth    providerauth.ReadinessGate
 	// ManualDispatchForTesting keeps deterministic fixture setup under direct
 	// DispatchNext control. Production configuration must leave it false.
 	ManualDispatchForTesting bool

@@ -3,6 +3,8 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+
+process.env.CURSOR_API_KEY = 'key';
 import { Agent, AgentNotFoundError, JsonlLocalAgentStore } from '@cursor/sdk';
 import {
   agentOptions, createCustomTools, createRuntime, installedSDKVersion, migrateLegacyAgentWorkspace,

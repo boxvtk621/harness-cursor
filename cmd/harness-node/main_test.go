@@ -116,6 +116,39 @@ func TestExplicitToolWorkspaceIsPinned(t *testing.T) {
 	}
 }
 
+func TestCredentialIsolationRejectsAncestorSymlinkIntoWorkspace(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "workspace")
+	if err := os.Mkdir(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "private-alias")
+	if err := os.Symlink(workspace, alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCredentialIsolation(filepath.Join(alias, "provider-auth"), workspace); err == nil {
+		t.Fatal("credential path through workspace ancestor symlink was accepted")
+	}
+}
+
+func TestCredentialIsolationAcceptsSeparateCanonicalDirectories(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "workspace")
+	credentials := filepath.Join(root, "provider-auth")
+	if err := os.Mkdir(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCredentialIsolation(credentials, workspace); err != nil {
+		t.Fatalf("separate credential directory rejected: %v", err)
+	}
+}
+
+func TestCredentialIsolationAllowsEmptyDenyModeWorkspace(t *testing.T) {
+	if err := validateCredentialIsolation(filepath.Join(t.TempDir(), "provider-auth"), ""); err != nil {
+		t.Fatalf("empty deny-mode workspace rejected: %v", err)
+	}
+}
+
 func TestFilePolicyPreservesLegacyDeny(t *testing.T) {
 	for _, test := range []struct {
 		name, manifest string

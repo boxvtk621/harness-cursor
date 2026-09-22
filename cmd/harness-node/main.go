@@ -13,6 +13,7 @@ import (
 	"github.com/boxvtk621/harness-cursor/adapters/contract"
 	"github.com/boxvtk621/harness-cursor/adapters/cursor"
 	harnessserver "github.com/boxvtk621/harness-cursor/api"
+	"github.com/boxvtk621/harness-cursor/providerauth"
 	"github.com/boxvtk621/harness-cursor/runtime"
 	"github.com/boxvtk621/harness-cursor/tools"
 	"io"
@@ -21,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -49,12 +51,14 @@ type config struct {
 }
 
 type cursorConfig struct {
-	NodeExecutable   string `json:"nodeExecutable"`
-	WorkerEntrypoint string `json:"workerEntrypoint"`
-	StateDir         string `json:"stateDir"`
-	WorkingDir       string `json:"workingDir"`
-	APIKeyFile       string `json:"apiKeyFile"`
-	Model            string `json:"model"`
+	NodeExecutable      string `json:"nodeExecutable"`
+	WorkerEntrypoint    string `json:"workerEntrypoint"`
+	StateDir            string `json:"stateDir"`
+	WorkingDir          string `json:"workingDir"`
+	APIKeyFile          string `json:"apiKeyFile,omitempty"`
+	CredentialsDir      string `json:"credentialsDir,omitempty"`
+	AuthProbeEntrypoint string `json:"authProbeEntrypoint,omitempty"`
+	Model               string `json:"model"`
 }
 
 type providerAdapter interface {
@@ -131,21 +135,29 @@ func serve(ctx context.Context, path string) error {
 		return err
 	}
 	artifacts := node.NewArtifactIngress()
-	adapter, err := openProviderAdapter(ctx, cfg, artifacts, policy)
+	adapter, auth, authBackend, err := openProviderRuntime(ctx, cfg, artifacts, policy)
 	if err != nil {
 		return err
 	}
 	defer adapter.Close()
+	// Establish provider truth before the node action loop can admit queued work.
+	// A transient probe failure deliberately leaves auth unknown and readiness
+	// blocked while still allowing the private auth API to recover it later.
+	if err := auth.Refresh(ctx); err != nil {
+		return err
+	}
 	authority, err := node.Open(ctx, node.Config{
 		DataDir: cfg.DataDir, NodeID: cfg.NodeID, OwnerID: cfg.OwnerID,
-		RegistryVersion: cfg.RegistryVersion, Adapter: adapter, Policies: policies, Artifacts: artifacts,
+		RegistryVersion: cfg.RegistryVersion, Adapter: adapter, Policies: policies, Artifacts: artifacts, ProviderAuth: auth,
 		ManualDispatchForTesting: cfg.ManualDispatchForTesting,
 	})
 	if err != nil {
 		return err
 	}
 	defer authority.Close()
-	handler, err := harnessserver.New(harnessserver.Config{NodeID: cfg.NodeID}, authority)
+	authBackend.SetBusy(authority.Busy)
+	auth.SetTransitionGate(authority.BeginProviderAuthTransition)
+	handler, err := harnessserver.New(harnessserver.Config{NodeID: cfg.NodeID, ProviderAuth: auth}, authority)
 	if err != nil {
 		return err
 	}
@@ -178,43 +190,97 @@ func serve(ctx context.Context, path string) error {
 	return err
 }
 
-func openProviderAdapter(ctx context.Context, cfg config, artifacts node.ArtifactSink, policy harnessadapter.PolicySnapshot) (providerAdapter, error) {
+func openProviderRuntime(ctx context.Context, cfg config, artifacts node.ArtifactSink, policy harnessadapter.PolicySnapshot) (providerAdapter, *providerauth.Manager, *cursor.AuthBackend, error) {
 	if err := validateProviderConfig(cfg); err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	switch selectedAdapter(cfg) {
 	case string(harnessadapter.KindCursor):
 		var runner toolrunner.Runner
 		if policy.ApprovalMode == harnessadapter.ApprovalModeExplicitOnce {
 			if err := validateExplicitToolWorkspace("Cursor", cfg.Cursor.WorkingDir); err != nil {
-				return nil, err
+				return nil, nil, nil, err
 			}
 			var err error
 			runner, err = newToolRunner(ctx)
 			if err != nil {
-				return nil, err
+				return nil, nil, nil, err
 			}
 		}
-		secretInfo, err := os.Lstat(cfg.Cursor.APIKeyFile)
-		if err != nil || !secretInfo.Mode().IsRegular() || secretInfo.Mode().Perm()&0o077 != 0 {
-			return nil, errors.New("private Cursor key file required")
-		}
-		key, err := boundedFile(cfg.Cursor.APIKeyFile, 4096)
-		if err != nil {
-			return nil, err
-		}
-		apiKey := strings.TrimSuffix(strings.TrimSuffix(string(key), "\n"), "\r")
-		if apiKey == "" || strings.ContainsAny(apiKey, "\r\n\x00") {
-			return nil, errors.New("Cursor key is invalid")
-		}
-		return cursor.New(cursor.Config{
+		managed, err := cursor.NewManaged(cursor.Config{
 			NodeExecutable: cfg.Cursor.NodeExecutable, WorkerEntrypoint: cfg.Cursor.WorkerEntrypoint,
-			StateDir: cfg.Cursor.StateDir, WorkingDir: cfg.Cursor.WorkingDir, APIKey: apiKey, Model: cfg.Cursor.Model,
+			StateDir: cfg.Cursor.StateDir, WorkingDir: cfg.Cursor.WorkingDir, Model: cfg.Cursor.Model,
 			OperationTimeout: 30 * time.Second, MaxFrameBytes: 8 << 20, ToolRunner: runner,
 		}, artifacts)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		credentialsDir := cfg.Cursor.CredentialsDir
+		if credentialsDir == "" {
+			credentialsDir = filepath.Join(cfg.Cursor.StateDir, "credentials")
+		}
+		if err := validateCredentialIsolation(credentialsDir, cfg.Cursor.WorkingDir); err != nil {
+			_ = managed.Close()
+			return nil, nil, nil, err
+		}
+		probeEntrypoint := cfg.Cursor.AuthProbeEntrypoint
+		if probeEntrypoint == "" {
+			probeEntrypoint = filepath.Join(filepath.Dir(cfg.Cursor.WorkerEntrypoint), "auth_probe.mjs")
+		}
+		backend, err := cursor.NewAuthBackend(managed, filepath.Join(credentialsDir, "cursor.key"), cfg.Cursor.APIKeyFile, cfg.Cursor.NodeExecutable, probeEntrypoint)
+		if err != nil {
+			_ = managed.Close()
+			return nil, nil, nil, err
+		}
+		auth, err := providerauth.Open(ctx, cfg.NodeID, credentialsDir, backend)
+		if err != nil {
+			_ = managed.Close()
+			return nil, nil, nil, err
+		}
+		return managed, auth, backend, nil
 	default:
-		return nil, errors.New("valid adapter selector is required")
+		return nil, nil, nil, errors.New("valid adapter selector is required")
 	}
+}
+
+func pathsOverlap(left, right string) bool {
+	if left == "" || right == "" {
+		return false
+	}
+	left, right = filepath.Clean(left), filepath.Clean(right)
+	within := func(base, candidate string) bool {
+		relative, err := filepath.Rel(base, candidate)
+		return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+	}
+	return within(left, right) || within(right, left)
+}
+
+func validateCredentialIsolation(credentialsDir, workingDir string) error {
+	if !filepath.IsAbs(credentialsDir) || workingDir != "" && !filepath.IsAbs(workingDir) {
+		return errors.New("Cursor credential and configured tool workspace paths must be absolute")
+	}
+	if err := os.MkdirAll(credentialsDir, 0o700); err != nil {
+		return errors.New("Cursor credential directory is unavailable")
+	}
+	info, err := os.Lstat(credentialsDir)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("Cursor credential directory is invalid")
+	}
+	canonicalCredentials, err := filepath.EvalSymlinks(credentialsDir)
+	if err != nil {
+		return errors.New("Cursor credential directory cannot be resolved")
+	}
+	if workingDir == "" {
+		return nil
+	}
+	canonicalWorking, err := filepath.EvalSymlinks(workingDir)
+	if err != nil {
+		return errors.New("Cursor tool workspace cannot be resolved")
+	}
+	if pathsOverlap(canonicalCredentials, canonicalWorking) {
+		return errors.New("Cursor credential and tool workspace paths overlap")
+	}
+	return nil
 }
 
 func validateExplicitToolWorkspace(adapter, workingDir string) error {

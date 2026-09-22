@@ -38,9 +38,9 @@ var (
 	uuidPattern       = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 )
 
-// Config contains only private adapter process settings. APIKey is sent in the
-// bounded init frame and never appears in argv, environment additions, events,
-// or the durable native-ID mapping.
+// Config contains only private adapter process settings. APIKey is supplied to
+// the pinned SDK through its supported CURSOR_API_KEY environment variable. It
+// never appears in argv, protocol frames, events, or durable native-ID mapping.
 type Config struct {
 	NodeExecutable   string
 	WorkerEntrypoint string
@@ -115,7 +115,7 @@ func New(config Config, artifacts node.ArtifactSink) (*Adapter, error) {
 		Version string `json:"version"`
 	}
 	err = worker.call(ctx, "init", map[string]any{
-		"apiKey": config.APIKey, "model": config.Model, "stateDir": config.StateDir,
+		"model": config.Model, "stateDir": config.StateDir,
 		"maxFrameBytes": config.MaxFrameBytes,
 	}, &initialized)
 	if err != nil || initialized.Version != harnessadapter.CursorSDKVersion {
