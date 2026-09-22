@@ -249,14 +249,15 @@ export function createRuntime(sdk, emit, installedVersion = SDK_VERSION, injecte
   }
 
   async function initialize(id, payload) {
-    if (config || !payload || !boundedString(payload.apiKey, 4096) || !boundedString(payload.model, 200) ||
+	const apiKey = process.env.CURSOR_API_KEY;
+	if (config || !payload || !boundedString(apiKey, 4096) || !boundedString(payload.model, 200) ||
         !boundedString(payload.stateDir, 4096) || !Number.isInteger(payload.maxFrameBytes) ||
         payload.maxFrameBytes < 4096 || payload.maxFrameBytes > 8 * 1024 * 1024) {
       rejected(id);
       return;
     }
     fs.mkdirSync(payload.stateDir, { recursive: true, mode: 0o700 });
-    config = { ...payload };
+	config = { ...payload, apiKey };
     store = new sdk.JsonlLocalAgentStore(path.join(config.stateDir, 'sdk-store'));
     response(id, { version: installedVersion });
   }

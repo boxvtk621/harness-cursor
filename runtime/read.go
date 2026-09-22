@@ -21,6 +21,31 @@ func (node *Node) authorizeRead(trust TrustContext) *Result {
 
 func (node *Node) NodeID() string { return node.config.NodeID }
 
+func (node *Node) Busy() bool {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	state, err := loadState(context.Background(), node.db)
+	return err != nil || state.ActiveAttemptID.Valid
+}
+
+// BeginProviderAuthTransition serializes credential replacement/logout with
+// the final dispatch commit and native provider Start/Resume call. Busy is
+// evaluated while the barrier is held, so an accepted auth transition cannot
+// overtake a provider start.
+func (node *Node) BeginProviderAuthTransition() (func(), bool) {
+	node.startGate.Lock()
+	return node.startGate.Unlock, node.Busy()
+}
+
+func (node *Node) effectiveReadiness(readiness string, reasons []string) (string, []string) {
+	result := append([]string(nil), reasons...)
+	if node.config.ProviderAuth != nil && !node.config.ProviderAuth.ProviderAuthReady() {
+		readiness = "blocked"
+		result = addReason(result, "auth_unavailable")
+	}
+	return readiness, result
+}
+
 // OwnerID is immutable historical namespace metadata, not caller identity.
 func (node *Node) OwnerID() string { return node.config.OwnerID }
 
@@ -171,12 +196,13 @@ func (node *Node) Admission(ctx context.Context, trust TrustContext) Result {
 	if err != nil {
 		return node.errorResult(http.StatusServiceUnavailable, "not_durable", "admission profile is unavailable", "", nil, "")
 	}
+	readiness, _ := node.effectiveReadiness(state.EngineReadiness, state.BlockedReasons)
 	profile := harnessprotocol.AdmissionProfile{
 		SchemaID: harnessprotocol.AdmissionSchemaID, OwnerID: node.config.OwnerID, NodeID: node.config.NodeID,
 		RegistrationRevision: node.config.RegistryVersion, IdentityEpoch: state.Epoch,
 		WireSchemaSHA256: harnessprotocol.SchemaSHA256,
 		Adapter:          harnessprotocol.AdapterIdentity{Kind: string(node.identity.Kind), Version: node.identity.Version},
-		Readiness:        state.EngineReadiness,
+		Readiness:        readiness,
 		Capabilities: harnessprotocol.AdmissionCapabilities{
 			Profile: true, NativeEpoch: true,
 			PolicyEnforcement: node.identity.Verified[harnessadapter.CapabilityPolicyEnforcement],
@@ -202,6 +228,7 @@ func (node *Node) ExecutorHeartbeat(ctx context.Context, trust TrustContext) Res
 	if err != nil {
 		return node.errorResult(http.StatusServiceUnavailable, "not_durable", "executor heartbeat is unavailable", "", nil, "")
 	}
+	readiness, _ := node.effectiveReadiness(state.EngineReadiness, state.BlockedReasons)
 	body, err := json.Marshal(struct {
 		NodeID     string `json:"nodeId"`
 		BootID     string `json:"bootId"`
@@ -209,7 +236,7 @@ func (node *Node) ExecutorHeartbeat(ctx context.Context, trust TrustContext) Res
 		Health     string `json:"health"`
 		Readiness  string `json:"readiness"`
 		Capacity   int    `json:"capacity"`
-	}{node.config.NodeID, node.bootID, node.executorHeartbeatAt(), "live", state.EngineReadiness, QueueCapacity})
+	}{node.config.NodeID, node.bootID, node.executorHeartbeatAt(), "live", readiness, QueueCapacity})
 	if err != nil {
 		return node.errorResult(http.StatusServiceUnavailable, "not_durable", "executor heartbeat is unavailable", "", nil, "")
 	}
@@ -234,5 +261,6 @@ func (node *Node) HealthReady(ctx context.Context, trust TrustContext) Result {
 	if json.Unmarshal(identityResult.Body, &identity) != nil {
 		return node.errorResult(http.StatusServiceUnavailable, "not_durable", "identity response is invalid", "", nil, "")
 	}
-	return node.wireResult("healthReady", harnessprotocol.HealthReady{ProtocolVersion: harnessprotocol.ProtocolVersion, SchemaID: harnessprotocol.SchemaID, CheckedAt: timestamp(node.config.Clock()), Identity: identity, Readiness: state.EngineReadiness, BlockedReasons: state.BlockedReasons})
+	readiness, reasons := node.effectiveReadiness(state.EngineReadiness, state.BlockedReasons)
+	return node.wireResult("healthReady", harnessprotocol.HealthReady{ProtocolVersion: harnessprotocol.ProtocolVersion, SchemaID: harnessprotocol.SchemaID, CheckedAt: timestamp(node.config.Clock()), Identity: identity, Readiness: readiness, BlockedReasons: reasons})
 }

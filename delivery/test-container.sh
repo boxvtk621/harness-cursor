@@ -10,14 +10,15 @@ else
 fi
 
 image=${1:?image name is required}
+resource_prefix=${SMOKE_RESOURCE_PREFIX:-harness-cursor-smoke}
 tmp=$(mktemp -d)
 config="$tmp/config"
 config_copy_source="$config"
 if test -n "${MSYSTEM:-}"; then
   config_copy_source=$(cygpath -w "$config")
 fi
-volume="harness-cursor-smoke-$$"
-network="harness-cursor-smoke-$$"
+volume="$resource_prefix-volume-$$"
+network="$resource_prefix-network-$$"
 container=""
 helper=""
 cleanup() {
@@ -45,7 +46,6 @@ cp "$tmp/ca.crt" "$tmp/server.crt" "$tmp/server.key" "$config/"
 printf 'smoke policy\n' >"$config/policy.txt"
 printf '[]\n' >"$config/tools-deny.json"
 printf '[{"name":"cursor.command"},{"name":"cursor.file_change"}]\n' >"$config/tools-explicit.json"
-printf 'smoke-api-key' >"$config/cursor.key"
 write_config() {
   name=$1
   manifest=$2
@@ -70,7 +70,8 @@ write_config() {
     "workerEntrypoint": "/opt/worker/worker.mjs",
     "stateDir": "/state/cursor",
     "workingDir": "$workspace",
-    "apiKeyFile": "/config/cursor.key",
+    "credentialsDir": "/provider-auth",
+    "authProbeEntrypoint": "/opt/worker/auth_probe.mjs",
     "model": "smoke-model"
   }
 }
@@ -81,11 +82,11 @@ write_config node-explicit.json tools-explicit.json explicit_once /workspace
 
 docker volume create "$volume" >/dev/null
 docker network create "$network" >/dev/null
-helper=$(docker create --user 0 --entrypoint /bin/sh --mount "type=volume,source=$volume,target=/config" "$image" -c true)
+helper=$(docker create --name "$resource_prefix-helper-$$" --user 0 --entrypoint /bin/sh --mount "type=volume,source=$volume,target=/config" "$image" -c true)
 docker cp "$config_copy_source/." "$helper:/config/"
 docker rm "$helper" >/dev/null
 helper=""
-docker run --rm --user 0 --entrypoint /bin/sh --mount "type=volume,source=$volume,target=/config" "$image" -c 'chown -R 10001:10001 /config && chmod 0600 /config/*.key && chmod 0644 /config/*.crt /config/*.json /config/*.txt' >/dev/null
+docker run --rm --user 0 --entrypoint /bin/sh --mount "type=volume,source=$volume,target=/config" "$image" -c 'chown -R 10001:10001 /config && chmod 0644 /config/*.crt /config/*.json /config/*.txt' >/dev/null
 
 stop_container() {
   docker stop "$container" >/dev/null
@@ -110,7 +111,8 @@ wait_starting() {
 
 valid_readiness() {
   printf '%s' "$1" | grep -q '"readiness":"blocked"' &&
-    printf '%s' "$1" | grep -q '"blockedReasons":\["policy_unavailable"\]' &&
+    printf '%s' "$1" | grep -q '"policy_unavailable"' &&
+    printf '%s' "$1" | grep -q '"auth_unavailable"' &&
     printf '%s' "$1" | grep -q '"kind":"cursor"' &&
     printf '%s' "$1" | grep -q '"version":"1.0.31"' &&
     printf '%s' "$1" | grep -q '"schemaSHA256":"5bd97f2ea08854a8e56d46ff11a1539e6bc54e8ca6d42841b366561accba73d9"'
@@ -132,15 +134,27 @@ wait_readiness() {
   return 1
 }
 
-container=$(docker run --detach --read-only --user 10001:10001 --pids-limit 128 --network "$network" --network-alias harness-smoke --tmpfs /state:rw,nosuid,nodev,noexec,size=64m,uid=10001,gid=10001,mode=0700 --mount "type=volume,source=$volume,target=/config,readonly" "$image" --config /config/node-deny.json)
+check_provider_auth() {
+  auth=$(docker run --rm --network "$network" --mount "type=volume,source=$volume,target=/config,readonly" curlimages/curl:8.16.0 --fail --silent --cacert /config/ca.crt "https://harness-smoke:8443/v1/provider-auth?nodeId=11111111-1111-4111-8111-111111111111")
+  printf '%s' "$auth" | grep -q '"schemaId":"harness-provider-auth-v1"'
+  printf '%s' "$auth" | grep -q '"state":"unauthenticated"'
+  printf '%s' "$auth" | grep -q '"methods":\["secret"\]'
+  if printf '%s' "$auth" | grep -qi 'secret.*value\|api.key'; then
+    return 1
+  fi
+}
+
+container=$(docker run --detach --name "$resource_prefix-deny-$$" --read-only --user 10001:10001 --pids-limit 128 --network "$network" --network-alias harness-smoke --tmpfs /state:rw,nosuid,nodev,noexec,size=64m,uid=10001,gid=10001,mode=0700 --tmpfs /provider-auth:rw,nosuid,nodev,noexec,size=4m,uid=10001,gid=10001,mode=0700 --mount "type=volume,source=$volume,target=/config,readonly" "$image" --config /config/node-deny.json)
 wait_starting
 wait_readiness
+check_provider_auth
 stop_container
 
 # explicit_once constructs and self-tests the packaged /harness-tool-runner.
-container=$(docker run --detach --read-only --user 10001:10001 --pids-limit 128 --memory 512m --network "$network" --network-alias harness-smoke --tmpfs /state:rw,nosuid,nodev,noexec,size=64m,uid=10001,gid=10001,mode=0700 --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m,uid=10001,gid=10001,mode=0700 --tmpfs /workspace:rw,nosuid,nodev,noexec,size=16m,uid=10001,gid=10001,mode=0700 --mount "type=volume,source=$volume,target=/config,readonly" "$image" --config /config/node-explicit.json)
+container=$(docker run --detach --name "$resource_prefix-explicit-$$" --read-only --user 10001:10001 --pids-limit 128 --memory 512m --network "$network" --network-alias harness-smoke --tmpfs /state:rw,nosuid,nodev,noexec,size=64m,uid=10001,gid=10001,mode=0700 --tmpfs /provider-auth:rw,nosuid,nodev,noexec,size=4m,uid=10001,gid=10001,mode=0700 --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m,uid=10001,gid=10001,mode=0700 --tmpfs /workspace:rw,nosuid,nodev,noexec,size=16m,uid=10001,gid=10001,mode=0700 --mount "type=volume,source=$volume,target=/config,readonly" "$image" --config /config/node-explicit.json)
 wait_starting
 wait_readiness
+check_provider_auth
 stop_container
 
 set +e

@@ -27,6 +27,7 @@ bin/
 dist/
 state/
 coverage/
+output/
 .provenance-source/
 _bmad/
 /output/

@@ -27,6 +27,9 @@ type dispatchCandidate struct {
 }
 
 func (node *Node) DispatchNext(ctx context.Context) (DispatchResult, error) {
+	if node.config.ProviderAuth != nil && !node.config.ProviderAuth.ProviderAuthReady() {
+		return DispatchResult{Outcome: "blocked"}, nil
+	}
 	candidate, err := node.peekDispatch(ctx)
 	if err != nil || candidate == nil {
 		return DispatchResult{Outcome: "idle"}, err
@@ -43,6 +46,14 @@ func (node *Node) DispatchNext(ctx context.Context) (DispatchResult, error) {
 	policy, err = harnessadapter.PreparePolicySnapshot(policy)
 	if err != nil {
 		node.blockPolicy(ctx)
+		return DispatchResult{Outcome: "blocked"}, nil
+	}
+
+	node.startGate.Lock()
+	defer node.startGate.Unlock()
+	// Auth may have changed during queue/policy lookup. Holding startGate makes
+	// this second check and the dispatch commit atomic with auth mutation.
+	if node.config.ProviderAuth != nil && !node.config.ProviderAuth.ProviderAuthReady() {
 		return DispatchResult{Outcome: "blocked"}, nil
 	}
 

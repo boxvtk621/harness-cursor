@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -61,6 +62,7 @@ type bridge struct {
 
 func startBridge(config Config, onEvent func(bridgeFrame), onRequest func(bridgeFrame), onExit func()) (*bridge, error) {
 	command := exec.Command(config.NodeExecutable, config.WorkerEntrypoint)
+	command.Env = append(os.Environ(), "CURSOR_API_KEY="+config.APIKey)
 	stdin, err := command.StdinPipe()
 	if err != nil {
 		return nil, err

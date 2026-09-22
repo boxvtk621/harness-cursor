@@ -103,6 +103,9 @@ func (node *Node) executorHeartbeatAt() string {
 }
 
 func (node *Node) claimAction(ctx context.Context, lane string) (postCommitAction, bool) {
+	if lane == "dispatch" && node.config.ProviderAuth != nil && !node.config.ProviderAuth.ProviderAuthReady() {
+		return postCommitAction{}, false
+	}
 	node.mu.Lock()
 	defer node.mu.Unlock()
 	tx, err := node.db.BeginTx(ctx, &sql.TxOptions{})
@@ -230,6 +233,13 @@ func (node *Node) performDispatch(ctx context.Context, action postCommitAction, 
 			node.startGate.Unlock()
 		}
 	}()
+	// A recovered dispatch action may have been claimed immediately before an
+	// auth transition closed admission. Put it back without touching provider
+	// state; the action loop will retry only after authentication is ready.
+	if node.config.ProviderAuth != nil && !node.config.ProviderAuth.ProviderAuthReady() {
+		node.requeueAction(action.commandID)
+		return
+	}
 	node.mu.Lock()
 	var prompt, boundaryMessageID, revision, contentHash, toolHash, approvalMode, effectiveHash string
 	var boundarySequence int64
@@ -300,6 +310,12 @@ func (node *Node) performDispatch(ctx context.Context, action postCommitAction, 
 	node.startGate.Unlock()
 	gateHeld = false
 	node.observeAdapterStream(ctx, reference)
+}
+
+func (node *Node) requeueAction(commandID string) {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	_, _ = node.db.Exec("UPDATE control_actions SET status='pending' WHERE command_id=? AND status='inflight'", commandID)
 }
 
 func (node *Node) markStarted(ctx context.Context, reference harnessadapter.AttemptRef) error {

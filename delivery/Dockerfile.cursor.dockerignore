@@ -18,6 +18,8 @@
 !internal/
 !internal/strictjson/
 !internal/strictjson/**
+!providerauth/
+!providerauth/**
 !runtime/
 !runtime/**
 !tools/
@@ -38,3 +40,4 @@ adapters/cursor/worker/node_modules
 **/_bmad-output
 **/provenance
 **/node_modules
+**/output

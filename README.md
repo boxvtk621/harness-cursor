@@ -8,7 +8,7 @@ The extraction source is `homelab-telegram-panel` commit `d5edfb20f358bb0ce243d0
 
 - The executable supports only `adapter: "cursor"`; Codex and unknown provider configuration fail closed before a provider process starts.
 - Schemas, fixtures, receipts, SQLite migrations, fencing, versions, and recovery semantics remain compatible with the pinned source snapshot; inbound client-certificate and actor authorization have been removed.
-- Panel, Router, Agent Service clients, host tunnels, Fixik, provider secrets, databases, state, and production configuration are not part of this repository.
+- Panel, Router, Agent Service clients, host tunnels, Fixik, shared provider secrets, databases, state, and production configuration are not part of this repository. The node owns its private provider-auth volume.
 - There is no sibling `replace`, shared database, shared volume, or build dependency on another checkout.
 
 Removing the Cursor code from the source monorepo, changing Panel deployment, publishing an image, and production cutover are separate integration operations. A green standalone candidate is a prerequisite, not authorization for those actions.
@@ -44,7 +44,6 @@ mkdir -p config
 printf 'non-empty policy\n' >config/policy.txt
 printf '[]\n' >config/tools-deny.json
 printf '[{"name":"cursor.command"},{"name":"cursor.file_change"}]\n' >config/tools-explicit.json
-printf '%s' 'replace-with-real-cursor-key' >config/cursor.key
 
 cat >config/node.json <<EOF
 {
@@ -65,14 +64,14 @@ cat >config/node.json <<EOF
     "workerEntrypoint": "/opt/worker/worker.mjs",
     "stateDir": "/state/cursor",
     "workingDir": "/workspace",
-    "apiKeyFile": "/config/cursor.key",
+    "credentialsDir": "/provider-auth",
+    "authProbeEntrypoint": "/opt/worker/auth_probe.mjs",
     "model": "configured-model"
   }
 }
 EOF
 sudo chown -R 10001:10001 config
 sudo chmod 0700 config
-sudo chmod 0600 config/*.key
 sudo chmod 0644 config/*.crt config/*.json config/*.txt
 ```
 
@@ -86,9 +85,20 @@ docker run --rm --read-only --user 10001:10001 \
   --tmpfs /state:rw,nosuid,nodev,noexec,size=64m,uid=10001,gid=10001,mode=0700 \
   --tmpfs /tmp:rw,nosuid,nodev,noexec,size=16m,uid=10001,gid=10001,mode=0700 \
   --tmpfs /workspace:rw,nosuid,nodev,noexec,size=16m,uid=10001,gid=10001,mode=0700 \
+  --tmpfs /provider-auth:rw,nosuid,nodev,noexec,size=4m,uid=10001,gid=10001,mode=0700 \
   --mount "type=bind,source=$PWD/config,target=/config,readonly" \
   --publish 127.0.0.1:8443:8443 \
   harness-cursor:local --config /config/node.json
 ```
 
-For durable use, replace only the `/state` tmpfs with a private persistent volume pre-owned by `10001:10001`; never share it with Panel, Router, Fixik, or another Harness. `/config` stays read-only, and only `server.key` plus `cursor.key` are readable by the runtime UID. Explicit-once mode additionally requires private writable `/tmp` for the helper self-test and `/workspace` for dialog workspaces. Do not place secret bytes in JSON, Git, logs, or image layers.
+For durable use, replace `/state` with a persistent volume and mount a second private persistent volume at `/provider-auth`, both pre-owned by `10001:10001`; never share either with Panel, Router, Fixik, another Harness, or the tool runner. `/config` stays read-only and only `server.key` is secret there. Explicit-once mode additionally requires private writable `/tmp` for the helper self-test and `/workspace` for dialog workspaces. Do not place provider secret bytes in JSON configuration, Git, logs, or image layers.
+
+## Provider authentication
+
+The provider-neutral API is described by `contracts/provider-auth-v1.schema.json`. Cursor declares only the `secret` method. `POST /v1/provider-auth/operations` accepts the write-only secret, validates it with the pinned SDK's `Cursor.me()` account call, and supplies it to the SDK only as `CURSOR_API_KEY`. This check does not create an agent or make a model request. `GET /v1/provider-auth?nodeId=<uuid>` never returns the secret or an account identifier.
+
+The node writes `/provider-auth/cursor.key` and `/provider-auth/state.json` atomically with owner-only permissions. File presence produces `unknown`, not `authenticated`; startup and explicit checks require a provider readback. A network failure produces `unknown` and keeps the credential, so a transient outage is not reported as revocation. Logout is local and removes this node's credential; it does not claim to revoke every provider session.
+
+The provider-auth ledger retains up to 4,096 command receipts and their referenced operations without eviction. Every known `commandId` remains replayable and can never start a second login; after the bound is reached, new auth commands fail closed with `busy` until an operator replaces the node's private auth volume under an explicit maintenance procedure. There is no automatic forget or replay window.
+
+`apiKeyFile` is optional and supported only as a legacy first-boot seed. Once auth state exists, it is never imported again, so logout remains effective across restarts. New deployments should omit it and use the write-only API.

@@ -6,6 +6,7 @@ COPY api/ api/
 COPY cmd/ cmd/
 COPY contracts/ contracts/
 COPY internal/ internal/
+COPY providerauth/ providerauth/
 COPY runtime/ runtime/
 COPY tools/ tools/
 ARG TARGETOS
@@ -17,7 +18,7 @@ FROM node:24.18.0-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd3
 WORKDIR /opt/worker
 COPY adapters/cursor/worker/package.json adapters/cursor/worker/package-lock.json ./
 RUN npm ci --ignore-scripts --no-audit --no-fund
-COPY adapters/cursor/worker/worker.mjs ./
+COPY adapters/cursor/worker/worker.mjs adapters/cursor/worker/auth_probe.mjs ./
 COPY --from=build /harness-node /harness-node
 COPY --chmod=0555 --from=build /harness-tool-runner /harness-tool-runner
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt

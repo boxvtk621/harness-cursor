@@ -25,6 +25,7 @@ import (
 	"github.com/boxvtk621/harness-cursor/contracts/tooltimeline"
 	"github.com/boxvtk621/harness-cursor/contracts/transcript-view"
 	"github.com/boxvtk621/harness-cursor/contracts/wire"
+	"github.com/boxvtk621/harness-cursor/providerauth"
 	"github.com/boxvtk621/harness-cursor/runtime"
 	"github.com/boxvtk621/harness-cursor/tests/fixture"
 )
@@ -33,8 +34,88 @@ const testNodeID = "20000000-0000-4000-8000-000000000001"
 
 type enoughSpace struct{}
 
+type authStub struct{ secret string }
+
+func authEnvelope() providerauth.Envelope {
+	return providerauth.Envelope{SchemaID: providerauth.SchemaID, NodeID: testNodeID, Revision: 1, State: providerauth.StateUnauthenticated, Capabilities: providerauth.Capabilities{Methods: []string{"secret"}, CanCheck: true, CanLogout: true}}
+}
+func (stub *authStub) Snapshot(_ context.Context, nodeID string) (providerauth.Envelope, *providerauth.APIError) {
+	if nodeID != testNodeID {
+		return providerauth.Envelope{}, providerauth.ErrNotFound
+	}
+	return authEnvelope(), nil
+}
+func (stub *authStub) Operation(context.Context, string, string) (providerauth.Envelope, *providerauth.APIError) {
+	return providerauth.Envelope{}, providerauth.ErrNotFound
+}
+func (stub *authStub) Start(_ context.Context, input providerauth.StartRequest) (providerauth.Envelope, *providerauth.APIError) {
+	stub.secret = input.Secret
+	envelope := authEnvelope()
+	envelope.Operation = &providerauth.Operation{OperationID: "30000000-0000-4000-8000-000000000001", CommandID: input.CommandID, Method: input.Method, Status: providerauth.OperationPending, CreatedAt: "2026-09-21T16:00:00Z", UpdatedAt: "2026-09-21T16:00:00Z"}
+	return envelope, nil
+}
+func (stub *authStub) Check(context.Context, providerauth.CommandRequest) (providerauth.Envelope, *providerauth.APIError) {
+	return authEnvelope(), nil
+}
+func (stub *authStub) Cancel(context.Context, string, providerauth.CommandRequest) (providerauth.Envelope, *providerauth.APIError) {
+	return authEnvelope(), nil
+}
+func (stub *authStub) Logout(context.Context, providerauth.CommandRequest) (providerauth.Envelope, *providerauth.APIError) {
+	return authEnvelope(), nil
+}
+
 func (enoughSpace) Measure(string) (node.SpaceInfo, error) {
 	return node.SpaceInfo{FreeBytes: 16 << 30, TotalBytes: 64 << 30}, nil
+}
+
+func TestProviderAuthRoutesAreStrictAndSecretIsWriteOnly(t *testing.T) {
+	authority, err := node.Open(context.Background(), node.Config{DataDir: t.TempDir(), NodeID: testNodeID, OwnerID: "1-1", RegistryVersion: 1, Adapter: fixture.NewAdapter(), Policies: fixture.NewPolicySource(), Space: enoughSpace{}, ManualDispatchForTesting: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer authority.Close()
+	auth := &authStub{}
+	handler, err := server.New(server.Config{NodeID: testNodeID, ProviderAuth: auth}, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := httptest.NewServer(handler)
+	defer endpoint.Close()
+	response, err := http.Get(endpoint.URL + "/v1/provider-auth?nodeId=" + testNodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(raw), `"schemaId":"harness-provider-auth-v1"`) || response.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("GET status=%d headers=%v body=%s", response.StatusCode, response.Header, raw)
+	}
+	response, err = http.Get(endpoint.URL + "/v1/provider-auth")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("missing nodeId status=%d", response.StatusCode)
+	}
+	body := `{"nodeId":"` + testNodeID + `","commandId":"40000000-0000-4000-8000-000000000001","method":"secret","secret":"write-only-value"}`
+	response, err = http.Post(endpoint.URL+"/v1/provider-auth/operations", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusAccepted || strings.Contains(string(raw), "write-only-value") || auth.secret != "write-only-value" {
+		t.Fatalf("POST status=%d body=%s captured=%q", response.StatusCode, raw, auth.secret)
+	}
+	response, err = http.Post(endpoint.URL+"/v1/provider-auth/operations", "application/json", strings.NewReader(strings.TrimSuffix(body, "}")+`,"unknown":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown field status=%d", response.StatusCode)
+	}
 }
 
 func TestRealTLSCommandsAndReadsWithoutInboundAuthorization(t *testing.T) {

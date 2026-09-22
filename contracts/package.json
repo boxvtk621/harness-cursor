@@ -11,6 +11,6 @@
     "ajv-formats": "3.0.1"
   },
   "scripts": {
-    "test": "node check-harness-v1-schema.mjs && node check-history-replica-v1.mjs && node check-transcript-view-v1.mjs && node check-dialog-tool-v1.mjs"
+    "test": "node check-harness-v1-schema.mjs && node check-history-replica-v1.mjs && node check-transcript-view-v1.mjs && node check-dialog-tool-v1.mjs && node check-provider-auth-v1.mjs"
   }
 }
