@@ -16,7 +16,10 @@ import (
 
 var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
-const maxCommandReceipts = 4096
+const (
+	maxCommandReceipts  = 4096
+	providerAuthTimeout = 30 * time.Second
+)
 
 type ProbeResult string
 
@@ -30,9 +33,22 @@ const (
 type Backend interface {
 	Bootstrap(context.Context, bool) (bool, error)
 	Probe(context.Context) ProbeResult
-	Replace(context.Context, string) error
 	Logout(context.Context) error
 	Busy() bool
+}
+
+// Replacement separates slow candidate construction from the fenced credential
+// commit. Commit is provisional until Finalize: Rollback must restore the prior
+// adapter and credential if cancellation, expiry, or durable persistence wins.
+type Replacement interface {
+	Commit(context.Context) error
+	Rollback() error
+	Finalize() error
+	Close() error
+}
+
+type replacementBackend interface {
+	PrepareReplacement(context.Context, string) (Replacement, error)
 }
 
 type commandRecord struct {
@@ -58,6 +74,7 @@ type Manager struct {
 	backend Backend
 	clock   func() time.Time
 	write   func(string, []byte) error
+	timeout time.Duration
 
 	mu            sync.Mutex
 	actionMu      sync.Mutex
@@ -71,10 +88,13 @@ func Open(ctx context.Context, nodeID, directory string, backend Backend) (*Mana
 	if !uuidPattern.MatchString(nodeID) || !filepath.IsAbs(directory) || backend == nil {
 		return nil, errors.New("provider auth config is incomplete")
 	}
+	if _, ok := backend.(replacementBackend); !ok {
+		return nil, errors.New("provider auth backend does not support transactional replacement")
+	}
 	if err := ensurePrivateDirectory(directory); err != nil {
 		return nil, err
 	}
-	manager := &Manager{nodeID: nodeID, dir: directory, path: filepath.Join(directory, "state.json"), backend: backend, clock: time.Now, write: atomicPrivateWrite, cancels: make(map[string]context.CancelFunc)}
+	manager := &Manager{nodeID: nodeID, dir: directory, path: filepath.Join(directory, "state.json"), backend: backend, clock: time.Now, write: atomicPrivateWrite, timeout: providerAuthTimeout, cancels: make(map[string]context.CancelFunc)}
 	firstRun, err := manager.load()
 	if err != nil {
 		return nil, err
@@ -164,6 +184,9 @@ func (manager *Manager) load() (bool, error) {
 func (manager *Manager) ProviderAuthReady() bool {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
+	if manager.expirePendingLocked(manager.clock()) != nil {
+		return false
+	}
 	if manager.state.State != StateAuthenticated || manager.transitioning {
 		return false
 	}
@@ -181,6 +204,9 @@ func (manager *Manager) Snapshot(_ context.Context, nodeID string) (Envelope, *A
 	if nodeID != manager.nodeID {
 		return Envelope{}, ErrNotFound
 	}
+	if manager.expirePendingLocked(manager.clock()) != nil {
+		return Envelope{}, ErrProviderUnavailable
+	}
 	return manager.envelopeLocked(""), nil
 }
 
@@ -192,6 +218,9 @@ func (manager *Manager) Operation(_ context.Context, nodeID, operationID string)
 	}
 	if !uuidPattern.MatchString(operationID) {
 		return Envelope{}, ErrInvalidRequest
+	}
+	if manager.expirePendingLocked(manager.clock()) != nil {
+		return Envelope{}, ErrProviderUnavailable
 	}
 	if _, ok := manager.state.Operations[operationID]; !ok {
 		return Envelope{}, ErrNotFound
@@ -217,6 +246,10 @@ func (manager *Manager) Start(_ context.Context, request StartRequest) (Envelope
 	release, busy := manager.beginTransition()
 	defer release()
 	manager.mu.Lock()
+	if manager.expirePendingLocked(manager.clock()) != nil {
+		manager.mu.Unlock()
+		return Envelope{}, ErrProviderUnavailable
+	}
 	if prior, ok := manager.state.Commands[request.CommandID]; ok {
 		defer manager.mu.Unlock()
 		if prior.Kind != "start:secret" {
@@ -243,8 +276,11 @@ func (manager *Manager) Start(_ context.Context, request StartRequest) (Envelope
 		manager.mu.Unlock()
 		return Envelope{}, ErrProviderUnavailable
 	}
-	now := manager.now()
-	operation := Operation{OperationID: operationID, CommandID: request.CommandID, Method: "secret", Status: OperationPending, CreatedAt: now, UpdatedAt: now}
+	nowTime := manager.clock()
+	now := manager.timestamp(nowTime)
+	deadline := nowTime.Add(manager.timeout)
+	timeout := manager.timestamp(deadline)
+	operation := Operation{OperationID: operationID, CommandID: request.CommandID, Method: "secret", Status: OperationPending, CreatedAt: now, UpdatedAt: now, TimeoutAt: &timeout}
 	manager.state.Operations[operationID] = operation
 	manager.state.Commands[request.CommandID] = commandRecord{Kind: "start:secret", OperationID: operationID}
 	manager.state.LatestID = operationID
@@ -255,51 +291,125 @@ func (manager *Manager) Start(_ context.Context, request StartRequest) (Envelope
 		manager.mu.Unlock()
 		return Envelope{}, ErrProviderUnavailable
 	}
-	operationContext, cancel := context.WithCancel(context.Background())
+	operationContext, cancel := context.WithDeadline(context.Background(), deadline)
 	manager.cancels[operationID] = cancel
 	envelope := manager.envelopeLocked(operationID)
 	manager.mu.Unlock()
+	go manager.expireOperation(operationContext, operationID, deadline)
 	go manager.replace(operationContext, operationID, request.Secret)
 	return envelope, nil
 }
 
 func (manager *Manager) replace(ctx context.Context, operationID, secret string) {
 	result := manager.backend.Probe(withSecret(ctx, secret))
+	switch result {
+	case ProbeAuthenticated:
+	case ProbeInvalid, ProbeUnauthenticated, ProbeUnavailable:
+		manager.finishReplacement(ctx, operationID, result, nil)
+		return
+	default:
+		manager.finishReplacement(ctx, operationID, ProbeUnavailable, nil)
+		return
+	}
+	replacement, err := manager.prepareReplacement(ctx, secret)
+	if err != nil || replacement == nil {
+		manager.finishReplacement(ctx, operationID, ProbeUnavailable, nil)
+		return
+	}
+	manager.finishReplacement(ctx, operationID, ProbeAuthenticated, replacement)
+	if err := replacement.Close(); err != nil {
+		manager.recordReplacementCleanupFailure(operationID)
+	}
+}
+
+func (manager *Manager) prepareReplacement(ctx context.Context, secret string) (Replacement, error) {
+	return manager.backend.(replacementBackend).PrepareReplacement(ctx, secret)
+}
+
+func (manager *Manager) finishReplacement(ctx context.Context, operationID string, result ProbeResult, replacement Replacement) {
+	manager.actionMu.Lock()
+	defer manager.actionMu.Unlock()
+	release := func() {}
+	busy := false
+	if result == ProbeAuthenticated && replacement != nil {
+		release, busy = manager.beginTransition()
+	}
+	defer release()
 	manager.mu.Lock()
+	if manager.expirePendingLocked(manager.clock()) != nil {
+		manager.mu.Unlock()
+		if replacement != nil {
+			_ = replacement.Rollback()
+		}
+		return
+	}
 	operation, current := manager.state.Operations[operationID]
 	if !current || operation.Status != OperationPending {
 		manager.mu.Unlock()
 		return
 	}
-	if ctx.Err() != nil {
-		reason := "cancelled"
-		operation.Status, operation.ReasonCode = OperationCancelled, &reason
-	} else if result == ProbeInvalid {
-		reason := "invalid_secret"
-		operation.Status, operation.ReasonCode = OperationFailed, &reason
-	} else if result == ProbeUnavailable {
-		reason := "provider_unavailable"
-		operation.Status, operation.ReasonCode = OperationFailed, &reason
-	} else {
-		err := manager.backend.Replace(withSecret(ctx, secret), secret)
-		operation, current = manager.state.Operations[operationID]
-		if !current || operation.Status != OperationPending {
-			manager.mu.Unlock()
-			return
+	terminalize := func(status OperationStatus, reason string) {
+		operation.Status, operation.ReasonCode, operation.UpdatedAt = status, &reason, manager.now()
+		manager.state.Operations[operationID] = operation
+		if cancel := manager.cancels[operationID]; cancel != nil {
+			cancel()
 		}
-		if err != nil {
-			reason := "provider_unavailable"
-			operation.Status, operation.ReasonCode = OperationFailed, &reason
-		} else {
-			operation.Status = OperationSucceeded
-			manager.state.State = StateAuthenticated
-			manager.state.ReasonCode = nil
-			checked := manager.now()
-			manager.state.CheckedAt = &checked
+		delete(manager.cancels, operationID)
+		manager.state.Revision++
+		if manager.persistLocked() != nil {
+			manager.failClosedLocked()
+			_ = manager.persistLocked()
 		}
 	}
-	operation.UpdatedAt = manager.now()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		terminalize(OperationExpired, "expired")
+		manager.mu.Unlock()
+		return
+	} else if ctx.Err() != nil {
+		terminalize(OperationCancelled, "cancelled")
+		manager.mu.Unlock()
+		return
+	} else if result == ProbeInvalid || result == ProbeUnauthenticated {
+		terminalize(OperationFailed, "invalid_secret")
+		manager.mu.Unlock()
+		return
+	} else if result == ProbeUnavailable || busy {
+		terminalize(OperationFailed, "provider_unavailable")
+		manager.mu.Unlock()
+		return
+	}
+	manager.transitioning = true
+	manager.mu.Unlock()
+
+	commitErr := replacement.Commit(ctx)
+	manager.mu.Lock()
+	manager.transitioning = false
+	expireErr := manager.expirePendingLocked(manager.clock())
+	operation, current = manager.state.Operations[operationID]
+	if expireErr != nil || !current || operation.Status != OperationPending || ctx.Err() != nil || commitErr != nil {
+		if current && operation.Status == OperationPending {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				terminalize(OperationExpired, "expired")
+			} else if ctx.Err() != nil {
+				terminalize(OperationCancelled, "cancelled")
+			} else {
+				terminalize(OperationFailed, "provider_unavailable")
+			}
+		}
+		manager.mu.Unlock()
+		if rollbackErr := replacement.Rollback(); rollbackErr != nil {
+			manager.recordReplacementCleanupFailure(operationID)
+		}
+		return
+	}
+	operation.Status, operation.ReasonCode, operation.UpdatedAt = OperationSucceeded, nil, manager.now()
 	manager.state.Operations[operationID] = operation
+	manager.state.State, manager.state.ReasonCode = StateAuthenticated, nil
+	checked := manager.now()
+	manager.state.CheckedAt = &checked
+	if cancel := manager.cancels[operationID]; cancel != nil {
+		cancel()
+	}
 	delete(manager.cancels, operationID)
 	manager.state.Revision++
 	if err := manager.persistLocked(); err != nil {
@@ -308,8 +418,44 @@ func (manager *Manager) replace(ctx context.Context, operationID, secret string)
 		manager.state.Operations[operationID] = operation
 		manager.failClosedLocked()
 		_ = manager.persistLocked()
+		manager.mu.Unlock()
+		if rollbackErr := replacement.Rollback(); rollbackErr != nil {
+			manager.recordReplacementCleanupFailure(operationID)
+		}
+		return
 	}
 	manager.mu.Unlock()
+	if err := replacement.Finalize(); err != nil {
+		manager.recordReplacementCleanupFailure(operationID)
+	}
+}
+
+func (manager *Manager) recordReplacementCleanupFailure(operationID string) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if operation, ok := manager.state.Operations[operationID]; ok && operation.Status == OperationPending {
+		reason := "provider_unavailable"
+		operation.Status, operation.ReasonCode, operation.UpdatedAt = OperationFailed, &reason, manager.now()
+		manager.state.Operations[operationID] = operation
+	}
+	manager.failClosedLocked()
+	_ = manager.persistLocked()
+}
+
+func (manager *Manager) expireOperation(ctx context.Context, operationID string, deadline time.Time) {
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	operation, ok := manager.state.Operations[operationID]
+	if !ok || operation.Status != OperationPending {
+		return
+	}
+	_ = manager.expirePendingLocked(manager.clock())
 }
 
 func (manager *Manager) Check(ctx context.Context, request CommandRequest) (Envelope, *APIError) {
@@ -319,6 +465,10 @@ func (manager *Manager) Check(ctx context.Context, request CommandRequest) (Enve
 		return Envelope{}, issue
 	}
 	manager.mu.Lock()
+	if manager.expirePendingLocked(manager.clock()) != nil {
+		manager.mu.Unlock()
+		return Envelope{}, ErrProviderUnavailable
+	}
 	if prior, ok := manager.state.Commands[request.CommandID]; ok {
 		defer manager.mu.Unlock()
 		if prior.Kind != "check" {
@@ -339,6 +489,10 @@ func (manager *Manager) Check(ctx context.Context, request CommandRequest) (Enve
 	manager.mu.Unlock()
 	result := manager.backend.Probe(ctx)
 	manager.mu.Lock()
+	if manager.expirePendingLocked(manager.clock()) != nil {
+		manager.mu.Unlock()
+		return Envelope{}, ErrProviderUnavailable
+	}
 	defer manager.mu.Unlock()
 	manager.state.Commands[request.CommandID] = commandRecord{Kind: "check"}
 	manager.state.Revision++
@@ -353,6 +507,9 @@ func (manager *Manager) Check(ctx context.Context, request CommandRequest) (Enve
 		reason := "credential_rejected"
 		manager.state.State, manager.state.ReasonCode = StateReauthenticationRequired, &reason
 	case ProbeUnavailable:
+		reason := "provider_unavailable"
+		manager.state.State, manager.state.ReasonCode = StateUnknown, &reason
+	default:
 		reason := "provider_unavailable"
 		manager.state.State, manager.state.ReasonCode = StateUnknown, &reason
 	}
@@ -370,6 +527,10 @@ func (manager *Manager) Refresh(ctx context.Context) error {
 	manager.actionMu.Lock()
 	defer manager.actionMu.Unlock()
 	manager.mu.Lock()
+	if err := manager.expirePendingLocked(manager.clock()); err != nil {
+		manager.mu.Unlock()
+		return err
+	}
 	for _, operation := range manager.state.Operations {
 		if operation.Status == OperationPending {
 			manager.mu.Unlock()
@@ -380,6 +541,9 @@ func (manager *Manager) Refresh(ctx context.Context) error {
 	result := manager.backend.Probe(ctx)
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
+	if err := manager.expirePendingLocked(manager.clock()); err != nil {
+		return err
+	}
 	manager.state.Revision++
 	checked := manager.now()
 	manager.state.CheckedAt = &checked
@@ -392,6 +556,9 @@ func (manager *Manager) Refresh(ctx context.Context) error {
 		reason := "credential_rejected"
 		manager.state.State, manager.state.ReasonCode = StateReauthenticationRequired, &reason
 	case ProbeUnavailable:
+		reason := "provider_unavailable"
+		manager.state.State, manager.state.ReasonCode = StateUnknown, &reason
+	default:
 		reason := "provider_unavailable"
 		manager.state.State, manager.state.ReasonCode = StateUnknown, &reason
 	}
@@ -411,6 +578,9 @@ func (manager *Manager) Cancel(_ context.Context, operationID string, request Co
 	}
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
+	if manager.expirePendingLocked(manager.clock()) != nil {
+		return Envelope{}, ErrProviderUnavailable
+	}
 	operation, ok := manager.state.Operations[operationID]
 	if !ok {
 		return Envelope{}, ErrNotFound
@@ -452,6 +622,10 @@ func (manager *Manager) Logout(ctx context.Context, request CommandRequest) (Env
 	release, busy := manager.beginTransition()
 	defer release()
 	manager.mu.Lock()
+	if manager.expirePendingLocked(manager.clock()) != nil {
+		manager.mu.Unlock()
+		return Envelope{}, ErrProviderUnavailable
+	}
 	if prior, ok := manager.state.Commands[request.CommandID]; ok {
 		defer manager.mu.Unlock()
 		if prior.Kind != "logout" {
@@ -526,6 +700,38 @@ func (manager *Manager) envelopeLocked(operationID string) Envelope {
 	return Envelope{SchemaID: SchemaID, NodeID: manager.nodeID, Revision: manager.state.Revision, State: manager.state.State, CheckedAt: manager.state.CheckedAt, ReasonCode: manager.state.ReasonCode, Capabilities: Capabilities{Methods: []string{"secret"}, CanCheck: true, CanLogout: true}, Operation: operation}
 }
 
+func (manager *Manager) expirePendingLocked(now time.Time) error {
+	changed := false
+	for id, operation := range manager.state.Operations {
+		if operation.Status != OperationPending || operation.TimeoutAt == nil {
+			continue
+		}
+		deadline, err := time.Parse(time.RFC3339Nano, *operation.TimeoutAt)
+		if err == nil && now.Before(deadline) {
+			continue
+		}
+		if cancel := manager.cancels[id]; cancel != nil {
+			cancel()
+		}
+		delete(manager.cancels, id)
+		reason := "expired"
+		operation.Status, operation.ReasonCode = OperationExpired, &reason
+		operation.UpdatedAt = manager.timestamp(now)
+		manager.state.Operations[id] = operation
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	manager.state.Revision++
+	if err := manager.persistLocked(); err != nil {
+		manager.failClosedLocked()
+		_ = manager.persistLocked()
+		return err
+	}
+	return nil
+}
+
 func (manager *Manager) persistLocked() error {
 	raw, err := json.Marshal(manager.state)
 	if err != nil {
@@ -551,7 +757,10 @@ func (manager *Manager) ensureCommandCapacityLocked() *APIError {
 	return nil
 }
 
-func (manager *Manager) now() string { return manager.clock().UTC().Format(time.RFC3339Nano) }
+func (manager *Manager) now() string { return manager.timestamp(manager.clock()) }
+func (manager *Manager) timestamp(value time.Time) string {
+	return value.UTC().Format(time.RFC3339Nano)
+}
 
 type secretContextKey struct{}
 

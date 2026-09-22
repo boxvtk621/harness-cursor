@@ -26,6 +26,20 @@ type AuthBackend struct {
 	busy func() bool
 }
 
+type authReplacement struct {
+	backend        *AuthBackend
+	adapter        *Adapter
+	prior          *Adapter
+	secret         string
+	previousSecret string
+	hadPrevious    bool
+	mu             sync.Mutex
+	committed      bool
+	finalized      bool
+	rolledBack     bool
+	closed         bool
+}
+
 func NewAuthBackend(managed *Managed, credentialFile, seedFile, nodeExecutable, probeEntrypoint string) (*AuthBackend, error) {
 	if managed == nil || !filepath.IsAbs(credentialFile) || nodeExecutable == "" || !filepath.IsAbs(probeEntrypoint) {
 		return nil, errors.New("cursor auth backend config is incomplete")
@@ -46,6 +60,9 @@ func (backend *AuthBackend) Busy() bool {
 }
 
 func (backend *AuthBackend) Bootstrap(ctx context.Context, firstRun bool) (bool, error) {
+	if err := backend.recoverInterruptedReplacement(); err != nil {
+		return false, err
+	}
 	secret, found, err := readPrivateSecret(backend.credentialFile)
 	if err != nil {
 		return false, err
@@ -101,16 +118,195 @@ func (backend *AuthBackend) Probe(ctx context.Context) providerauth.ProbeResult 
 	return providerauth.ProbeUnavailable
 }
 
-func (backend *AuthBackend) Replace(_ context.Context, secret string) error {
-	replacement, err := backend.managed.Prepare(secret)
+func (backend *AuthBackend) Replace(ctx context.Context, secret string) error {
+	replacement, err := backend.PrepareReplacement(ctx, secret)
 	if err != nil {
 		return err
 	}
-	if err := writePrivateSecret(backend.credentialFile, secret); err != nil {
-		replacement.Close()
+	defer replacement.Close()
+	if err := replacement.Commit(ctx); err != nil {
+		_ = replacement.Rollback()
 		return err
 	}
-	return backend.managed.Swap(replacement)
+	if err := ctx.Err(); err != nil {
+		if rollbackErr := replacement.Rollback(); rollbackErr != nil {
+			return errors.Join(err, rollbackErr)
+		}
+		return err
+	}
+	return replacement.Finalize()
+}
+
+func (backend *AuthBackend) PrepareReplacement(ctx context.Context, secret string) (providerauth.Replacement, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	replacement, err := backend.managed.Prepare(secret)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = replacement.Close()
+		return nil, err
+	}
+	return &authReplacement{backend: backend, adapter: replacement, secret: secret}, nil
+}
+
+func (replacement *authReplacement) Commit(ctx context.Context) error {
+	replacement.mu.Lock()
+	defer replacement.mu.Unlock()
+	if replacement.closed || replacement.committed || replacement.finalized || replacement.rolledBack || replacement.adapter == nil {
+		return errors.New("cursor replacement is unavailable")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	previous, hadPrevious, err := readPrivateSecret(replacement.backend.credentialFile)
+	if err != nil {
+		return err
+	}
+	replacement.previousSecret, replacement.hadPrevious = previous, hadPrevious
+	if err := replacement.backend.writeRollbackMarker(previous, hadPrevious); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = replacement.backend.removeRollbackMarker()
+		return err
+	}
+	replacement.prior, err = replacement.backend.managed.Exchange(replacement.adapter)
+	if err != nil {
+		_ = replacement.backend.removeRollbackMarker()
+		return err
+	}
+	replacement.committed = true
+	if err := ctx.Err(); err != nil {
+		return errors.Join(err, replacement.rollbackLocked())
+	}
+	if err := writePrivateSecret(replacement.backend.credentialFile, replacement.secret); err != nil {
+		return errors.Join(err, replacement.rollbackLocked())
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.Join(err, replacement.rollbackLocked())
+	}
+	return nil
+}
+
+func (replacement *authReplacement) Rollback() error {
+	replacement.mu.Lock()
+	defer replacement.mu.Unlock()
+	return replacement.rollbackLocked()
+}
+
+func (replacement *authReplacement) rollbackLocked() error {
+	if replacement.finalized || replacement.rolledBack {
+		return nil
+	}
+	var rollbackErr error
+	if replacement.committed {
+		if err := replacement.backend.managed.Restore(replacement.adapter, replacement.prior); err != nil {
+			rollbackErr = errors.Join(rollbackErr, err)
+		} else if replacement.adapter != nil {
+			// Adapter.Close reports the expected worker kill status; the
+			// generation has already been detached under Managed's lock.
+			_ = replacement.adapter.Close()
+			replacement.adapter = nil
+		}
+		rollbackErr = errors.Join(rollbackErr, restorePrivateSecret(replacement.backend.credentialFile, replacement.previousSecret, replacement.hadPrevious))
+	} else if replacement.adapter != nil {
+		_ = replacement.adapter.Close()
+		replacement.adapter = nil
+	}
+	if rollbackErr != nil {
+		return rollbackErr
+	}
+	if err := replacement.backend.removeRollbackMarker(); err != nil {
+		return err
+	}
+	replacement.rolledBack = true
+	return nil
+}
+
+func (replacement *authReplacement) Finalize() error {
+	replacement.mu.Lock()
+	defer replacement.mu.Unlock()
+	if replacement.closed || !replacement.committed || replacement.rolledBack {
+		return errors.New("cursor replacement is unavailable")
+	}
+	if replacement.finalized {
+		return nil
+	}
+	if err := replacement.backend.removeRollbackMarker(); err != nil {
+		return err
+	}
+	replacement.finalized = true
+	replacement.adapter = nil // The managed adapter now owns the candidate.
+	if replacement.prior != nil {
+		_ = replacement.prior.Close()
+		replacement.prior = nil
+	}
+	return nil
+}
+
+func (replacement *authReplacement) Close() error {
+	replacement.mu.Lock()
+	defer replacement.mu.Unlock()
+	if replacement.closed {
+		return nil
+	}
+	replacement.closed = true
+	if replacement.committed && !replacement.finalized && !replacement.rolledBack {
+		return replacement.rollbackLocked()
+	}
+	if replacement.adapter == nil {
+		return nil
+	}
+	_ = replacement.adapter.Close()
+	replacement.adapter = nil
+	return nil
+}
+
+func (backend *AuthBackend) rollbackMarkerPath() string {
+	return backend.credentialFile + ".rollback"
+}
+
+func (backend *AuthBackend) writeRollbackMarker(secret string, existed bool) error {
+	marker := "0"
+	if existed {
+		marker = "1" + secret
+	}
+	return writePrivateSecret(backend.rollbackMarkerPath(), marker)
+}
+
+func (backend *AuthBackend) removeRollbackMarker() error {
+	path := backend.rollbackMarkerPath()
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	directory, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
+}
+
+func (backend *AuthBackend) recoverInterruptedReplacement() error {
+	marker, found, err := readPrivateSecret(backend.rollbackMarkerPath())
+	if err != nil || !found {
+		return err
+	}
+	switch {
+	case marker == "0":
+		err = restorePrivateSecret(backend.credentialFile, "", false)
+	case strings.HasPrefix(marker, "1") && len(marker) > 1:
+		err = restorePrivateSecret(backend.credentialFile, marker[1:], true)
+	default:
+		err = errors.New("cursor rollback marker is invalid")
+	}
+	if err != nil {
+		return err
+	}
+	return backend.removeRollbackMarker()
 }
 
 func (backend *AuthBackend) Logout(context.Context) error {
@@ -198,4 +394,19 @@ func writePrivateSecret(path, secret string) error {
 	}
 	ok = true
 	return nil
+}
+
+func restorePrivateSecret(path, secret string, existed bool) error {
+	if existed {
+		return writePrivateSecret(path, secret)
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	directory, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }

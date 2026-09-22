@@ -35,21 +35,46 @@ func (managed *Managed) Prepare(secret string) (*Adapter, error) {
 }
 
 func (managed *Managed) Swap(replacement *Adapter) error {
-	if replacement == nil {
-		return errors.New("cursor replacement is nil")
+	prior, err := managed.Exchange(replacement)
+	if err != nil {
+		if replacement != nil {
+			_ = replacement.Close()
+		}
+		return err
 	}
-	managed.mu.Lock()
-	if managed.closed {
-		managed.mu.Unlock()
-		replacement.Close()
-		return errors.New("managed cursor adapter is closed")
-	}
-	prior := managed.current
-	managed.current = replacement
-	managed.mu.Unlock()
 	if prior != nil {
 		_ = prior.Close()
 	}
+	return nil
+}
+
+// Exchange installs a replacement without closing the prior adapter so an
+// authentication transaction can still roll back until durable success.
+func (managed *Managed) Exchange(replacement *Adapter) (*Adapter, error) {
+	if replacement == nil {
+		return nil, errors.New("cursor replacement is nil")
+	}
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.closed {
+		return nil, errors.New("managed cursor adapter is closed")
+	}
+	prior := managed.current
+	managed.current = replacement
+	return prior, nil
+}
+
+// Restore replaces the expected provisional adapter with its predecessor.
+func (managed *Managed) Restore(expected, prior *Adapter) error {
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.closed {
+		return errors.New("managed cursor adapter is closed")
+	}
+	if managed.current != expected {
+		return errors.New("cursor replacement generation changed")
+	}
+	managed.current = prior
 	return nil
 }
 

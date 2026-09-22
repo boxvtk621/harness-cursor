@@ -2,6 +2,7 @@ package providerauth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -15,15 +16,23 @@ import (
 const testNodeID = "11111111-1111-4111-8111-111111111111"
 
 type fakeBackend struct {
-	mu           sync.Mutex
-	result       ProbeResult
-	replaced     string
-	has          bool
-	busy         bool
-	probe        chan struct{}
-	probeStarted chan struct{}
-	logoutGate   chan struct{}
-	logoutCalled chan struct{}
+	mu                   sync.Mutex
+	result               ProbeResult
+	replaced             string
+	has                  bool
+	busy                 bool
+	probe                chan struct{}
+	probeStarted         chan struct{}
+	prepare              chan struct{}
+	prepareStarted       chan struct{}
+	ignorePrepareContext bool
+	commit               chan struct{}
+	commitStarted        chan struct{}
+	ignoreCommitContext  bool
+	returnNilReplacement bool
+	closedCandidates     int
+	logoutGate           chan struct{}
+	logoutCalled         chan struct{}
 }
 
 func (backend *fakeBackend) Bootstrap(context.Context, bool) (bool, error) { return backend.has, nil }
@@ -51,6 +60,94 @@ func (backend *fakeBackend) Replace(_ context.Context, secret string) error {
 	backend.replaced = secret
 	backend.has = true
 	backend.mu.Unlock()
+	return nil
+}
+func (backend *fakeBackend) PrepareReplacement(ctx context.Context, secret string) (Replacement, error) {
+	if backend.prepareStarted != nil {
+		select {
+		case backend.prepareStarted <- struct{}{}:
+		default:
+		}
+	}
+	if backend.prepare != nil {
+		if backend.ignorePrepareContext {
+			<-backend.prepare
+		} else {
+			select {
+			case <-backend.prepare:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+	}
+	if backend.returnNilReplacement {
+		return nil, nil
+	}
+	return &fakeReplacement{backend: backend, secret: secret}, nil
+}
+
+type fakeReplacement struct {
+	backend   *fakeBackend
+	secret    string
+	previous  string
+	had       bool
+	committed bool
+	finished  bool
+}
+
+func (replacement *fakeReplacement) Commit(ctx context.Context) error {
+	if replacement.backend.commitStarted != nil {
+		select {
+		case replacement.backend.commitStarted <- struct{}{}:
+		default:
+		}
+	}
+	if replacement.backend.commit != nil {
+		if replacement.backend.ignoreCommitContext {
+			<-replacement.backend.commit
+		} else {
+			select {
+			case <-replacement.backend.commit:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	replacement.backend.mu.Lock()
+	replacement.previous, replacement.had = replacement.backend.replaced, replacement.backend.has
+	replacement.backend.replaced = replacement.secret
+	replacement.backend.has = true
+	replacement.backend.mu.Unlock()
+	replacement.committed = true
+	return nil
+}
+
+func (replacement *fakeReplacement) Rollback() error {
+	if !replacement.committed || replacement.finished {
+		return nil
+	}
+	replacement.backend.mu.Lock()
+	replacement.backend.replaced, replacement.backend.has = replacement.previous, replacement.had
+	replacement.backend.mu.Unlock()
+	replacement.finished = true
+	return nil
+}
+
+func (replacement *fakeReplacement) Finalize() error {
+	replacement.finished = true
+	return nil
+}
+
+func (replacement *fakeReplacement) Close() error {
+	if replacement.committed && replacement.finished {
+		return nil
+	}
+	replacement.backend.mu.Lock()
+	replacement.backend.closedCandidates++
+	replacement.backend.mu.Unlock()
 	return nil
 }
 func (backend *fakeBackend) Logout(ctx context.Context) error {
@@ -150,6 +247,193 @@ func TestInvalidReplacementPreservesAuthenticatedState(t *testing.T) {
 	}
 }
 
+func TestUnauthenticatedProbeCannotCommitReplacement(t *testing.T) {
+	backend := &fakeBackend{result: ProbeUnauthenticated}
+	manager, err := Open(context.Background(), testNodeID, t.TempDir(), backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, issue := manager.Start(context.Background(), StartRequest{NodeID: testNodeID, CommandID: "20000000-0000-4000-8000-000000000017", Method: "secret", Secret: "candidate"})
+	if issue != nil {
+		t.Fatal(issue)
+	}
+	failed := waitOperation(t, manager, started.Operation.OperationID, OperationFailed)
+	if failed.State == StateAuthenticated || backend.replaced != "" || failed.Operation.ReasonCode == nil || *failed.Operation.ReasonCode != "invalid_secret" {
+		t.Fatalf("unauthenticated probe committed replacement: envelope=%+v replaced=%q", failed, backend.replaced)
+	}
+}
+
+func TestReplacementExpiryDiscardsLateCandidateAndPreservesExistingAuth(t *testing.T) {
+	backend := &fakeBackend{result: ProbeAuthenticated}
+	manager, err := Open(context.Background(), testNodeID, t.TempDir(), backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, issue := manager.Start(context.Background(), StartRequest{NodeID: testNodeID, CommandID: "20000000-0000-4000-8000-000000000018", Method: "secret", Secret: "existing"})
+	if issue != nil {
+		t.Fatal(issue)
+	}
+	waitOperation(t, manager, first.Operation.OperationID, OperationSucceeded)
+	prepare, prepareStarted := make(chan struct{}), make(chan struct{}, 1)
+	backend.prepare, backend.prepareStarted, backend.ignorePrepareContext = prepare, prepareStarted, true
+	manager.timeout = 30 * time.Millisecond
+	second, issue := manager.Start(context.Background(), StartRequest{NodeID: testNodeID, CommandID: "20000000-0000-4000-8000-000000000019", Method: "secret", Secret: "late"})
+	if issue != nil || second.Operation == nil || second.Operation.TimeoutAt == nil {
+		t.Fatalf("start=%+v issue=%+v", second, issue)
+	}
+	select {
+	case <-prepareStarted:
+	case <-time.After(time.Second):
+		t.Fatal("replacement preparation did not start")
+	}
+	expired := waitOperation(t, manager, second.Operation.OperationID, OperationExpired)
+	close(prepare)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		backend.mu.Lock()
+		replaced, closed := backend.replaced, backend.closedCandidates
+		backend.mu.Unlock()
+		if replaced == "existing" && closed == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	backend.mu.Lock()
+	replaced, closed := backend.replaced, backend.closedCandidates
+	backend.mu.Unlock()
+	if expired.State != StateAuthenticated || !manager.ProviderAuthReady() || replaced != "existing" || closed != 1 {
+		t.Fatalf("late replacement escaped fence: envelope=%+v ready=%v replaced=%q closed=%d", expired, manager.ProviderAuthReady(), replaced, closed)
+	}
+}
+
+func TestExpiryWatchdogPersistsWithoutReadPolling(t *testing.T) {
+	directory := t.TempDir()
+	prepare, prepareStarted := make(chan struct{}), make(chan struct{}, 1)
+	backend := &fakeBackend{result: ProbeAuthenticated, prepare: prepare, prepareStarted: prepareStarted, ignorePrepareContext: true}
+	manager, err := Open(context.Background(), testNodeID, directory, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.timeout = 25 * time.Millisecond
+	started, issue := manager.Start(context.Background(), StartRequest{NodeID: testNodeID, CommandID: "20000000-0000-4000-8000-000000000021", Method: "secret", Secret: "candidate"})
+	if issue != nil || started.Operation == nil {
+		t.Fatalf("start=%+v issue=%+v", started, issue)
+	}
+	select {
+	case <-prepareStarted:
+	case <-time.After(time.Second):
+		t.Fatal("replacement preparation did not start")
+	}
+	deadline := time.Now().Add(time.Second)
+	var persisted persistedState
+	for time.Now().Before(deadline) {
+		raw, readErr := os.ReadFile(filepath.Join(directory, "state.json"))
+		if readErr == nil && json.Unmarshal(raw, &persisted) == nil && persisted.Operations[started.Operation.OperationID].Status == OperationExpired {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if persisted.Operations[started.Operation.OperationID].Status != OperationExpired {
+		t.Fatalf("watchdog did not durably expire idle operation: %+v", persisted.Operations[started.Operation.OperationID])
+	}
+	close(prepare)
+}
+
+func TestDeadlineDuringCommitExpiresAndRollsBackCandidate(t *testing.T) {
+	commit, commitStarted := make(chan struct{}), make(chan struct{}, 1)
+	backend := &fakeBackend{result: ProbeAuthenticated, replaced: "existing", has: true, commit: commit, commitStarted: commitStarted, ignoreCommitContext: true}
+	manager, err := Open(context.Background(), testNodeID, t.TempDir(), backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.timeout = 25 * time.Millisecond
+	started, issue := manager.Start(context.Background(), StartRequest{NodeID: testNodeID, CommandID: "20000000-0000-4000-8000-000000000022", Method: "secret", Secret: "late"})
+	if issue != nil || started.Operation == nil {
+		t.Fatalf("start=%+v issue=%+v", started, issue)
+	}
+	select {
+	case <-commitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("replacement commit did not start")
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(commit)
+	expired := waitOperation(t, manager, started.Operation.OperationID, OperationExpired)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		backend.mu.Lock()
+		replaced := backend.replaced
+		backend.mu.Unlock()
+		if replaced == "existing" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	backend.mu.Lock()
+	replaced := backend.replaced
+	backend.mu.Unlock()
+	if replaced != "existing" || manager.ProviderAuthReady() {
+		t.Fatalf("late commit escaped rollback: envelope=%+v replaced=%q", expired, replaced)
+	}
+}
+
+func TestInvalidProbeAndNilReplacementFailClosed(t *testing.T) {
+	for name, backend := range map[string]*fakeBackend{
+		"unknown probe":   {result: ProbeResult("future-value")},
+		"nil replacement": {result: ProbeAuthenticated, returnNilReplacement: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			manager, err := Open(context.Background(), testNodeID, t.TempDir(), backend)
+			if err != nil {
+				t.Fatal(err)
+			}
+			started, issue := manager.Start(context.Background(), StartRequest{NodeID: testNodeID, CommandID: "20000000-0000-4000-8000-000000000023", Method: "secret", Secret: "candidate"})
+			if issue != nil || started.Operation == nil {
+				t.Fatalf("start=%+v issue=%+v", started, issue)
+			}
+			failed := waitOperation(t, manager, started.Operation.OperationID, OperationFailed)
+			if failed.Operation.ReasonCode == nil || *failed.Operation.ReasonCode != "provider_unavailable" {
+				t.Fatalf("unexpected terminal result: %+v", failed)
+			}
+		})
+	}
+}
+
+func TestReplacementCommitCannotOvertakeRuntimeBusyTransition(t *testing.T) {
+	prepare, prepareStarted := make(chan struct{}), make(chan struct{}, 1)
+	backend := &fakeBackend{result: ProbeAuthenticated, prepare: prepare, prepareStarted: prepareStarted}
+	manager, err := Open(context.Background(), testNodeID, t.TempDir(), backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gateMu sync.Mutex
+	busy := false
+	manager.SetTransitionGate(func() (func(), bool) {
+		gateMu.Lock()
+		return gateMu.Unlock, busy
+	})
+	started, issue := manager.Start(context.Background(), StartRequest{NodeID: testNodeID, CommandID: "20000000-0000-4000-8000-000000000020", Method: "secret", Secret: "candidate"})
+	if issue != nil || started.Operation == nil {
+		t.Fatalf("start=%+v issue=%+v", started, issue)
+	}
+	select {
+	case <-prepareStarted:
+	case <-time.After(time.Second):
+		t.Fatal("replacement preparation did not start")
+	}
+	gateMu.Lock()
+	busy = true
+	gateMu.Unlock()
+	close(prepare)
+	failed := waitOperation(t, manager, started.Operation.OperationID, OperationFailed)
+	backend.mu.Lock()
+	replaced, closed := backend.replaced, backend.closedCandidates
+	backend.mu.Unlock()
+	if failed.Operation.ReasonCode == nil || *failed.Operation.ReasonCode != "provider_unavailable" || replaced != "" || closed != 1 {
+		t.Fatalf("busy transition accepted replacement: envelope=%+v replaced=%q closed=%d", failed, replaced, closed)
+	}
+}
+
 func TestPendingConflictCancelAndBusyLogout(t *testing.T) {
 	blocked := make(chan struct{})
 	backend := &fakeBackend{result: ProbeAuthenticated, probe: blocked}
@@ -179,6 +463,81 @@ func TestPendingConflictCancelAndBusyLogout(t *testing.T) {
 	_, issue = manager.Logout(context.Background(), command("20000000-0000-4000-8000-000000000007"))
 	if issue == nil || issue.Code != "busy" {
 		t.Fatalf("busy logout=%+v", issue)
+	}
+}
+
+func seedExpiredOperation(t *testing.T, manager *Manager, id string) {
+	t.Helper()
+	past := manager.timestamp(manager.clock().Add(-time.Second))
+	now := manager.now()
+	manager.mu.Lock()
+	manager.state.Operations[id] = Operation{OperationID: id, CommandID: id, Method: "secret", Status: OperationPending, CreatedAt: now, UpdatedAt: now, TimeoutAt: &past}
+	manager.state.LatestID = id
+	if err := manager.persistLocked(); err != nil {
+		manager.mu.Unlock()
+		t.Fatal(err)
+	}
+	manager.mu.Unlock()
+}
+
+func TestExpiredOperationCannotBeCancelledOrBlockRefreshAndLogout(t *testing.T) {
+	t.Run("cancel preserves expiry", func(t *testing.T) {
+		manager, err := Open(context.Background(), testNodeID, t.TempDir(), &fakeBackend{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		operationID := "30000000-0000-4000-8000-000000000024"
+		seedExpiredOperation(t, manager, operationID)
+		envelope, issue := manager.Cancel(context.Background(), operationID, command("20000000-0000-4000-8000-000000000024"))
+		if issue != nil || envelope.Operation == nil || envelope.Operation.Status != OperationExpired {
+			t.Fatalf("cancel=%+v issue=%+v", envelope, issue)
+		}
+	})
+
+	t.Run("refresh probes after expiry", func(t *testing.T) {
+		backend := &fakeBackend{result: ProbeAuthenticated, has: true}
+		manager, err := Open(context.Background(), testNodeID, t.TempDir(), backend)
+		if err != nil {
+			t.Fatal(err)
+		}
+		operationID := "30000000-0000-4000-8000-000000000025"
+		seedExpiredOperation(t, manager, operationID)
+		if err := manager.Refresh(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		envelope, issue := manager.Operation(context.Background(), testNodeID, operationID)
+		if issue != nil || envelope.Operation.Status != OperationExpired || envelope.State != StateAuthenticated {
+			t.Fatalf("refresh=%+v issue=%+v", envelope, issue)
+		}
+	})
+
+	t.Run("logout proceeds after expiry", func(t *testing.T) {
+		backend := &fakeBackend{has: true}
+		manager, err := Open(context.Background(), testNodeID, t.TempDir(), backend)
+		if err != nil {
+			t.Fatal(err)
+		}
+		operationID := "30000000-0000-4000-8000-000000000026"
+		seedExpiredOperation(t, manager, operationID)
+		envelope, issue := manager.Logout(context.Background(), command("20000000-0000-4000-8000-000000000026"))
+		if issue != nil || envelope.Operation == nil || envelope.Operation.Status != OperationExpired || envelope.State != StateUnauthenticated {
+			t.Fatalf("logout=%+v issue=%+v", envelope, issue)
+		}
+	})
+}
+
+func TestExpiryPersistenceFailureRejectsNewMutation(t *testing.T) {
+	manager, err := Open(context.Background(), testNodeID, t.TempDir(), &fakeBackend{result: ProbeAuthenticated})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedExpiredOperation(t, manager, "30000000-0000-4000-8000-000000000027")
+	manager.mu.Lock()
+	manager.write = func(string, []byte) error { return errors.New("injected persistence failure") }
+	manager.mu.Unlock()
+	_, issue := manager.Start(context.Background(), StartRequest{NodeID: testNodeID, CommandID: "20000000-0000-4000-8000-000000000027", Method: "secret", Secret: "candidate"})
+	if issue == nil || issue.Code != "provider_unavailable" {
+		t.Fatalf("new mutation escaped failed expiry persistence: %+v", issue)
 	}
 }
 

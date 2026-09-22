@@ -38,7 +38,7 @@ func (node *Node) BeginProviderAuthTransition() (func(), bool) {
 }
 
 func (node *Node) effectiveReadiness(readiness string, reasons []string) (string, []string) {
-	result := append([]string(nil), reasons...)
+	result := append(make([]string, 0, len(reasons)), reasons...)
 	if node.config.ProviderAuth != nil && !node.config.ProviderAuth.ProviderAuthReady() {
 		readiness = "blocked"
 		result = addReason(result, "auth_unavailable")
