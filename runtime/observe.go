@@ -15,6 +15,7 @@ import (
 	"github.com/boxvtk621/harness-cursor/adapters/contract"
 	"github.com/boxvtk621/harness-cursor/contracts/transcript-view"
 	"github.com/boxvtk621/harness-cursor/contracts/wire"
+	"github.com/boxvtk621/harness-cursor/internal/diagnosticlog"
 )
 
 func (node *Node) observeAdapterStream(ctx context.Context, reference harnessadapter.AttemptRef) {
@@ -151,6 +152,20 @@ func (node *Node) ObserveAdapterEvent(ctx context.Context, expected harnessadapt
 	publication.retainForCommit()
 	if err := tx.Commit(); err != nil {
 		return err
+	}
+	if terminal {
+		switch value := event.(type) {
+		case harnessadapter.TerminalEvent:
+			node.config.Diagnostics.Emit(diagnosticlog.LevelInfo, diagnosticlog.ComponentRuntime, diagnosticlog.EventAttemptTerminal, diagnosticlog.Fields{
+				NodeID: actual.NodeID, DialogID: actual.DialogID, RequestID: actual.RequestID, AttemptID: actual.AttemptID,
+				Generation: actual.Generation, Outcome: string(value.Outcome), EffectStatus: value.EffectStatus,
+			})
+		case harnessadapter.UnknownEvent:
+			node.config.Diagnostics.Emit(diagnosticlog.LevelWarn, diagnosticlog.ComponentRuntime, diagnosticlog.EventAttemptUnknown, diagnosticlog.Fields{
+				NodeID: actual.NodeID, DialogID: actual.DialogID, RequestID: actual.RequestID, AttemptID: actual.AttemptID,
+				Generation: actual.Generation, EffectStatus: value.EffectStatus, Reason: value.Reason,
+			})
+		}
 	}
 	released := !state.ActiveAttemptID.Valid || state.ActiveAttemptID.String != expected.AttemptID
 	if released {
@@ -568,7 +583,12 @@ func (node *Node) markAttemptUnknown(ctx context.Context, reference harnessadapt
 	if err := node.setAttemptUnknown(ctx, tx, &state, reference, reason, effectStatus); err != nil || saveState(ctx, tx, state) != nil {
 		return
 	}
-	_ = tx.Commit()
+	if tx.Commit() == nil {
+		node.config.Diagnostics.Emit(diagnosticlog.LevelWarn, diagnosticlog.ComponentRuntime, diagnosticlog.EventAttemptUnknown, diagnosticlog.Fields{
+			NodeID: reference.NodeID, DialogID: reference.DialogID, RequestID: reference.RequestID, AttemptID: reference.AttemptID,
+			Generation: reference.Generation, Reason: reason, EffectStatus: effectStatus,
+		})
+	}
 }
 
 func (node *Node) setAttemptUnknown(ctx context.Context, tx *sql.Tx, state *durableState, reference harnessadapter.AttemptRef, reason, effectStatus string) error {

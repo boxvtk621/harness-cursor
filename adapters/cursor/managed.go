@@ -7,6 +7,7 @@ import (
 
 	"github.com/boxvtk621/harness-cursor/adapters/contract"
 	"github.com/boxvtk621/harness-cursor/contracts/wire"
+	"github.com/boxvtk621/harness-cursor/internal/diagnosticlog"
 	"github.com/boxvtk621/harness-cursor/runtime"
 )
 
@@ -24,6 +25,9 @@ func NewManaged(config Config, artifacts node.ArtifactSink) (*Managed, error) {
 	config.APIKey = ""
 	if config.NodeExecutable == "" || config.WorkerEntrypoint == "" || config.StateDir == "" {
 		return nil, errors.New("managed cursor adapter config is incomplete")
+	}
+	if config.Diagnostics == nil {
+		config.Diagnostics = diagnosticlog.Disabled()
 	}
 	return &Managed{config: config, artifacts: artifacts}, nil
 }

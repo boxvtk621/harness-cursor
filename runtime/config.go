@@ -13,6 +13,7 @@ import (
 
 	"github.com/boxvtk621/harness-cursor/adapters/contract"
 	"github.com/boxvtk621/harness-cursor/contracts/wire"
+	"github.com/boxvtk621/harness-cursor/internal/diagnosticlog"
 	"github.com/boxvtk621/harness-cursor/providerauth"
 )
 
@@ -68,6 +69,7 @@ type Config struct {
 	StartupFault    func(StartupPoint) error
 	Artifacts       *ArtifactIngress
 	ProviderAuth    providerauth.ReadinessGate
+	Diagnostics     *diagnosticlog.Logger
 	// ManualDispatchForTesting keeps deterministic fixture setup under direct
 	// DispatchNext control. Production configuration must leave it false.
 	ManualDispatchForTesting bool
@@ -90,6 +92,9 @@ func (config *Config) defaults() error {
 	}
 	if config.Artifacts == nil {
 		config.Artifacts = NewArtifactIngress()
+	}
+	if config.Diagnostics == nil {
+		config.Diagnostics = diagnosticlog.Disabled()
 	}
 	return nil
 }

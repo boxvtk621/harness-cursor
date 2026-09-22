@@ -7,6 +7,7 @@ import (
 	"slices"
 
 	"github.com/boxvtk621/harness-cursor/adapters/contract"
+	"github.com/boxvtk621/harness-cursor/internal/diagnosticlog"
 )
 
 // recoverPristinePolicy upgrades only the exact unused state written by older
@@ -122,5 +123,12 @@ func (node *Node) recoverStartup(ctx context.Context) error {
 	if err := saveState(ctx, tx, state); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	node.config.Diagnostics.Emit(diagnosticlog.LevelWarn, diagnosticlog.ComponentRuntime, diagnosticlog.EventRuntimeRecovered, diagnosticlog.Fields{
+		NodeID: reference.NodeID, DialogID: reference.DialogID, RequestID: reference.RequestID, AttemptID: reference.AttemptID,
+		Generation: reference.Generation, Reason: "dispatch_uncertain", Outcome: "unknown",
+	})
+	return nil
 }

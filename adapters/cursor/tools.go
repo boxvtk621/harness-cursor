@@ -15,6 +15,7 @@ import (
 
 	"github.com/boxvtk621/harness-cursor/adapters/contract"
 	"github.com/boxvtk621/harness-cursor/contracts/wire"
+	"github.com/boxvtk621/harness-cursor/internal/diagnosticlog"
 	"github.com/boxvtk621/harness-cursor/tools"
 )
 
@@ -124,6 +125,10 @@ func (adapter *Adapter) executeWorkerTool(frame bridgeFrame) (workerToolResult, 
 	runtime.push(harnessadapter.ToolStartedEvent{
 		EventBase: harnessadapter.EventBase{Attempt: runtime.reference}, CallID: callID,
 		ToolName: toolName, ActionHash: actionHash, Input: input,
+	})
+	adapter.config.Diagnostics.Emit(diagnosticlog.LevelInfo, diagnosticlog.ComponentProvider, diagnosticlog.EventToolStarted, diagnosticlog.Fields{
+		NodeID: runtime.reference.NodeID, DialogID: runtime.reference.DialogID, RequestID: runtime.reference.RequestID,
+		AttemptID: runtime.reference.AttemptID, CallID: callID, Tool: toolName, Generation: runtime.reference.Generation,
 	})
 
 	effectful := request.Kind == toolrunner.KindFileChange || request.Command.Access == toolrunner.AccessWrite
@@ -250,6 +255,11 @@ func (adapter *Adapter) completeTool(runtime *attemptRuntime, nativeCallID, call
 		EventBase: harnessadapter.EventBase{Attempt: runtime.reference}, CallID: callID,
 		Status: status, Result: content, EffectStatus: effectStatus, EffectRef: effectRef,
 		FullText: fullText, FullTextIncomplete: incomplete,
+	})
+	adapter.config.Diagnostics.Emit(diagnosticlog.LevelInfo, diagnosticlog.ComponentProvider, diagnosticlog.EventToolCompleted, diagnosticlog.Fields{
+		NodeID: runtime.reference.NodeID, DialogID: runtime.reference.DialogID, RequestID: runtime.reference.RequestID,
+		AttemptID: runtime.reference.AttemptID, CallID: callID, Tool: state.toolName, Outcome: status, EffectStatus: effectStatus,
+		Generation: runtime.reference.Generation, Truncated: incomplete,
 	})
 }
 

@@ -13,6 +13,7 @@ import (
 	"github.com/boxvtk621/harness-cursor/adapters/contract"
 	"github.com/boxvtk621/harness-cursor/adapters/cursor"
 	harnessserver "github.com/boxvtk621/harness-cursor/api"
+	"github.com/boxvtk621/harness-cursor/internal/diagnosticlog"
 	"github.com/boxvtk621/harness-cursor/providerauth"
 	"github.com/boxvtk621/harness-cursor/runtime"
 	"github.com/boxvtk621/harness-cursor/tools"
@@ -75,7 +76,15 @@ func main() {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-	if err := serve(ctx, *path); err != nil {
+	diagnostics := diagnosticlog.New(os.Stderr)
+	err := serve(ctx, *path, diagnostics)
+	if err != nil {
+		diagnostics.Emit(diagnosticlog.LevelError, diagnosticlog.ComponentService, diagnosticlog.EventServiceFailed, diagnosticlog.Fields{Reason: "start_or_serve_failed"})
+	}
+	shutdown, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
+	_ = diagnostics.Shutdown(shutdown)
+	shutdownCancel()
+	if err != nil {
 		// Provider errors and configuration can contain credentials or prompts.
 		fmt.Fprintln(os.Stderr, "HARNESS_START_OR_SERVE_FAILED")
 		os.Exit(1)
@@ -112,7 +121,7 @@ func loadConfig(path string) (config, error) {
 	return cfg, nil
 }
 
-func serve(ctx context.Context, path string) error {
+func serve(ctx context.Context, path string, diagnostics *diagnosticlog.Logger) error {
 	cfg, err := loadConfig(path)
 	if err != nil {
 		return err
@@ -120,6 +129,10 @@ func serve(ctx context.Context, path string) error {
 	if err := validateProviderConfig(cfg); err != nil {
 		return err
 	}
+	if diagnostics == nil {
+		diagnostics = diagnosticlog.Disabled()
+	}
+	diagnostics.SetNodeID(cfg.NodeID)
 	host, port, err := net.SplitHostPort(cfg.Listen)
 	if err != nil || net.ParseIP(host) == nil || port == "" {
 		return errors.New("explicit listen IP and port required")
@@ -135,7 +148,7 @@ func serve(ctx context.Context, path string) error {
 		return err
 	}
 	artifacts := node.NewArtifactIngress()
-	adapter, auth, authBackend, err := openProviderRuntime(ctx, cfg, artifacts, policy)
+	adapter, auth, authBackend, err := openProviderRuntime(ctx, cfg, artifacts, policy, diagnostics)
 	if err != nil {
 		return err
 	}
@@ -149,7 +162,7 @@ func serve(ctx context.Context, path string) error {
 	authority, err := node.Open(ctx, node.Config{
 		DataDir: cfg.DataDir, NodeID: cfg.NodeID, OwnerID: cfg.OwnerID,
 		RegistryVersion: cfg.RegistryVersion, Adapter: adapter, Policies: policies, Artifacts: artifacts, ProviderAuth: auth,
-		ManualDispatchForTesting: cfg.ManualDispatchForTesting,
+		ManualDispatchForTesting: cfg.ManualDispatchForTesting, Diagnostics: diagnostics,
 	})
 	if err != nil {
 		return err
@@ -157,7 +170,7 @@ func serve(ctx context.Context, path string) error {
 	defer authority.Close()
 	authBackend.SetBusy(authority.Busy)
 	auth.SetTransitionGate(authority.BeginProviderAuthTransition)
-	handler, err := harnessserver.New(harnessserver.Config{NodeID: cfg.NodeID, ProviderAuth: auth}, authority)
+	handler, err := harnessserver.New(harnessserver.Config{NodeID: cfg.NodeID, ProviderAuth: auth, Diagnostics: diagnostics}, authority)
 	if err != nil {
 		return err
 	}
@@ -183,14 +196,16 @@ func serve(ctx context.Context, path string) error {
 		}
 	}()
 	fmt.Fprintln(os.Stdout, "HARNESS_STARTING")
+	diagnostics.Emit(diagnosticlog.LevelInfo, diagnosticlog.ComponentService, diagnosticlog.EventServiceStarting, diagnosticlog.Fields{})
 	err = server.ListenAndServeTLS("", "")
 	if errors.Is(err, http.ErrServerClosed) {
+		diagnostics.Emit(diagnosticlog.LevelInfo, diagnosticlog.ComponentService, diagnosticlog.EventServiceStopped, diagnosticlog.Fields{})
 		return nil
 	}
 	return err
 }
 
-func openProviderRuntime(ctx context.Context, cfg config, artifacts node.ArtifactSink, policy harnessadapter.PolicySnapshot) (providerAdapter, *providerauth.Manager, *cursor.AuthBackend, error) {
+func openProviderRuntime(ctx context.Context, cfg config, artifacts node.ArtifactSink, policy harnessadapter.PolicySnapshot, diagnostics *diagnosticlog.Logger) (providerAdapter, *providerauth.Manager, *cursor.AuthBackend, error) {
 	if err := validateProviderConfig(cfg); err != nil {
 		return nil, nil, nil, err
 	}
@@ -210,7 +225,7 @@ func openProviderRuntime(ctx context.Context, cfg config, artifacts node.Artifac
 		managed, err := cursor.NewManaged(cursor.Config{
 			NodeExecutable: cfg.Cursor.NodeExecutable, WorkerEntrypoint: cfg.Cursor.WorkerEntrypoint,
 			StateDir: cfg.Cursor.StateDir, WorkingDir: cfg.Cursor.WorkingDir, Model: cfg.Cursor.Model,
-			OperationTimeout: 30 * time.Second, MaxFrameBytes: 8 << 20, ToolRunner: runner,
+			OperationTimeout: 30 * time.Second, MaxFrameBytes: 8 << 20, ToolRunner: runner, Diagnostics: diagnostics,
 		}, artifacts)
 		if err != nil {
 			return nil, nil, nil, err

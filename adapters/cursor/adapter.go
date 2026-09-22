@@ -17,6 +17,7 @@ import (
 
 	"github.com/boxvtk621/harness-cursor/adapters/contract"
 	"github.com/boxvtk621/harness-cursor/contracts/wire"
+	"github.com/boxvtk621/harness-cursor/internal/diagnosticlog"
 	"github.com/boxvtk621/harness-cursor/runtime"
 	"github.com/boxvtk621/harness-cursor/tools"
 )
@@ -51,6 +52,7 @@ type Config struct {
 	OperationTimeout time.Duration
 	MaxFrameBytes    int
 	ToolRunner       toolrunner.Runner
+	Diagnostics      *diagnosticlog.Logger
 }
 
 // Adapter owns the Cursor agent/run references. Only AttemptRef values cross
@@ -91,6 +93,9 @@ func New(config Config, artifacts node.ArtifactSink) (*Adapter, error) {
 	if config.MaxFrameBytes < 4096 || config.MaxFrameBytes > harnessprotocol.MaximumWireBytes {
 		return nil, errors.New("cursor worker frame limit is invalid")
 	}
+	if config.Diagnostics == nil {
+		config.Diagnostics = diagnosticlog.Disabled()
+	}
 	store, err := openMappingStore(config.StateDir)
 	if err != nil {
 		return nil, err
@@ -125,6 +130,7 @@ func New(config Config, artifacts node.ArtifactSink) (*Adapter, error) {
 		}
 		return nil, errors.New("cursor worker SDK version mismatch")
 	}
+	adapter.config.Diagnostics.Emit(diagnosticlog.LevelInfo, diagnosticlog.ComponentProvider, diagnosticlog.EventProviderReady, diagnosticlog.Fields{Operation: "init"})
 	return adapter, nil
 }
 
@@ -345,7 +351,13 @@ func (adapter *Adapter) Close() error {
 		runtime.cancelExecution()
 	}
 	adapter.mu.Unlock()
-	return adapter.bridge.Close()
+	err := adapter.bridge.Close()
+	level, outcome, reason := diagnosticlog.LevelInfo, "stopped", ""
+	if err != nil {
+		level, outcome, reason = diagnosticlog.LevelWarn, "failed", "shutdown_failed"
+	}
+	adapter.config.Diagnostics.Emit(level, diagnosticlog.ComponentProvider, diagnosticlog.EventProviderExited, diagnosticlog.Fields{Operation: "shutdown", Outcome: outcome, Reason: reason, Count: adapter.bridge.suppressedStderrBytes()})
+	return err
 }
 
 func (adapter *Adapter) active(reference harnessadapter.AttemptRef) (persistedAttempt, *attemptRuntime) {
@@ -439,11 +451,15 @@ func protocolFailure(code, message string) *harnessadapter.Failure {
 
 func (adapter *Adapter) handleWorkerExit() {
 	adapter.mu.Lock()
+	closed := adapter.closed
 	runtimes := make([]*attemptRuntime, 0, len(adapter.attempts))
 	for _, runtime := range adapter.attempts {
 		runtimes = append(runtimes, runtime)
 	}
 	adapter.mu.Unlock()
+	if !closed {
+		adapter.config.Diagnostics.Emit(diagnosticlog.LevelWarn, diagnosticlog.ComponentProvider, diagnosticlog.EventProviderExited, diagnosticlog.Fields{Reason: "worker_exit", Outcome: "unexpected", Count: adapter.bridge.suppressedStderrBytes()})
+	}
 	for _, runtime := range runtimes {
 		outcome := runtime.reconcile().Outcome
 		if outcome == harnessadapter.ReconcileRunning || outcome == harnessadapter.ReconcileWaitingInput {
