@@ -10,6 +10,7 @@ import (
 
 	"github.com/boxvtk621/harness-cursor/adapters/contract"
 	"github.com/boxvtk621/harness-cursor/contracts/wire"
+	"github.com/boxvtk621/harness-cursor/internal/diagnosticlog"
 )
 
 func (node *Node) afterCommit(_ context.Context, action postCommitAction) {
@@ -362,7 +363,13 @@ func (node *Node) markStarted(ctx context.Context, reference harnessadapter.Atte
 	if err := saveState(ctx, tx, state); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	node.config.Diagnostics.Emit(diagnosticlog.LevelInfo, diagnosticlog.ComponentRuntime, diagnosticlog.EventAttemptStarted, diagnosticlog.Fields{
+		NodeID: reference.NodeID, DialogID: reference.DialogID, RequestID: reference.RequestID, AttemptID: reference.AttemptID, Generation: reference.Generation,
+	})
+	return nil
 }
 
 func actionStatus(outcome harnessadapter.ResponseOutcome) string {

@@ -93,6 +93,14 @@ docker run --rm --read-only --user 10001:10001 \
 
 For durable use, replace `/state` with a persistent volume and mount a second private persistent volume at `/provider-auth`, both pre-owned by `10001:10001`; never share either with Panel, Router, Fixik, another Harness, or the tool runner. `/config` stays read-only and only `server.key` is secret there. Explicit-once mode additionally requires private writable `/tmp` for the helper self-test and `/workspace` for dialog workspaces. Do not place provider secret bytes in JSON configuration, Git, logs, or image layers.
 
+### Diagnostic logs
+
+The node writes bounded JSON Lines diagnostics to stderr using schema `harness.console.v1`. The existing `HARNESS_STARTING` stdout sentinel is unchanged. Cursor worker stdout, the auth-probe stdout, and tool-runner stdout are private protocols and never carry diagnostic records.
+
+Diagnostics contain only allowlisted lifecycle event names, mandatory `nodeId`, per-process `bootId`, stable reason/error codes, UUID correlations, counters, durations, and booleans. They never contain prompts, messages, policy text, file content or paths, tool arguments or output, provider responses, credentials, device codes, or raw exception strings. Logging is best-effort: producers use a 256-entry non-blocking queue, each record is at most 4 KiB, and dropped or failed writes are summarized when the sink becomes available. Logs are operational evidence only; durable Harness state and receipts remain the source of truth.
+
+The shared catalogue covers service and recovery lifecycle, runtime open/recovery/close, provider process ready/exit, accepted/rejected/deduplicated commands, attempt dispatch/start/terminal/unknown, tool start/completion, provider-auth and readiness states observed at API boundaries, and bounded logger-loss summaries. These API events report observed state and are not a second authoritative state machine. Poll reads, streaming deltas, prompts, provider frames, tool output, and other high-frequency or sensitive data are deliberately excluded.
+
 ## Provider authentication
 
 The provider-neutral API is described by `contracts/provider-auth-v1.schema.json`. Cursor declares only the `secret` method. `POST /v1/provider-auth/operations` accepts the write-only secret, validates it with the pinned SDK's `Cursor.me()` account call, and supplies it to the SDK only as `CURSOR_API_KEY`. This check does not create an agent or make a model request. `GET /v1/provider-auth?nodeId=<uuid>` never returns the secret or an account identifier.

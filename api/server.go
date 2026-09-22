@@ -9,12 +9,14 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/boxvtk621/harness-cursor/contracts/barrier"
 	"github.com/boxvtk621/harness-cursor/contracts/history-replica"
 	"github.com/boxvtk621/harness-cursor/contracts/transcript-view"
 	"github.com/boxvtk621/harness-cursor/contracts/wire"
+	"github.com/boxvtk621/harness-cursor/internal/diagnosticlog"
 	"github.com/boxvtk621/harness-cursor/internal/strictjson"
 	"github.com/boxvtk621/harness-cursor/providerauth"
 	"github.com/boxvtk621/harness-cursor/runtime"
@@ -23,11 +25,15 @@ import (
 type Config struct {
 	NodeID       string
 	ProviderAuth providerauth.Service
+	Diagnostics  *diagnosticlog.Logger
 }
 
 func New(config Config, authority *node.Node) (http.Handler, error) {
 	if authority == nil || config.NodeID == "" || authority.NodeID() != config.NodeID {
 		return nil, errors.New("server config is incomplete")
+	}
+	if config.Diagnostics == nil {
+		config.Diagnostics = diagnosticlog.Disabled()
 	}
 	server := &Server{config: config, node: authority}
 	mux := http.NewServeMux()
@@ -590,9 +596,12 @@ func (server *Server) events(writer http.ResponseWriter, request *http.Request) 
 }
 
 type Server struct {
-	config  Config
-	node    *node.Node
-	handler http.Handler
+	config        Config
+	node          *node.Node
+	handler       http.Handler
+	logMu         sync.Mutex
+	lastAuth      map[string]string
+	lastReadiness string
 }
 
 func (server *Server) providerNodeID(request *http.Request) (string, bool) {
@@ -635,6 +644,7 @@ func (server *Server) providerAuth(writer http.ResponseWriter, request *http.Req
 		return
 	}
 	envelope, issue := server.config.ProviderAuth.Snapshot(request.Context(), nodeID)
+	server.logAuthEnvelope(envelope, issue, "snapshot", "", "")
 	writeProviderAuth(writer, http.StatusOK, envelope, issue)
 }
 
@@ -645,6 +655,7 @@ func (server *Server) providerAuthOperation(writer http.ResponseWriter, request 
 		return
 	}
 	envelope, issue := server.config.ProviderAuth.Operation(request.Context(), nodeID, request.PathValue("operationId"))
+	server.logAuthEnvelope(envelope, issue, "operation", "", request.PathValue("operationId"))
 	writeProviderAuth(writer, http.StatusOK, envelope, issue)
 }
 
@@ -659,6 +670,7 @@ func (server *Server) providerAuthStart(writer http.ResponseWriter, request *htt
 		return
 	}
 	envelope, issue := server.config.ProviderAuth.Start(request.Context(), input)
+	server.logAuthEnvelope(envelope, issue, input.Method, input.CommandID, "")
 	writeProviderAuth(writer, http.StatusAccepted, envelope, issue)
 }
 
@@ -694,11 +706,96 @@ func (server *Server) providerAuthCommand(writer http.ResponseWriter, request *h
 	case "logout":
 		envelope, issue = server.config.ProviderAuth.Logout(request.Context(), input)
 	}
+	server.logAuthEnvelope(envelope, issue, kind, input.CommandID, operationID)
 	writeProviderAuth(writer, http.StatusOK, envelope, issue)
 }
 
 func (server *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	server.handler.ServeHTTP(writer, request)
+}
+
+func (server *Server) logAuthEnvelope(envelope providerauth.Envelope, issue *providerauth.APIError, action, commandID, operationID string) {
+	if issue != nil {
+		if !server.authTransition(operationID, commandID+":"+action, string(diagnosticlog.EventProviderAuthFailed)+":rejected") {
+			return
+		}
+		server.config.Diagnostics.Emit(diagnosticlog.LevelWarn, diagnosticlog.ComponentAPI, diagnosticlog.EventProviderAuthFailed, diagnosticlog.Fields{
+			NodeID: server.config.NodeID, CommandID: commandID, OperationID: operationID, Operation: action,
+			Outcome: "rejected", Reason: issue.Code,
+		})
+		return
+	}
+	event, outcome := diagnosticlog.EventProviderAuthCompleted, string(envelope.State)
+	if action == "logout" {
+		event = diagnosticlog.EventProviderAuthLogout
+	}
+	if envelope.Operation != nil {
+		commandID, operationID, outcome = envelope.Operation.CommandID, envelope.Operation.OperationID, string(envelope.Operation.Status)
+		switch envelope.Operation.Status {
+		case providerauth.OperationPending:
+			event = diagnosticlog.EventProviderAuthStarted
+		case providerauth.OperationCancelled:
+			event = diagnosticlog.EventProviderAuthCancelled
+		case providerauth.OperationExpired:
+			event = diagnosticlog.EventProviderAuthExpired
+		case providerauth.OperationFailed:
+			event = diagnosticlog.EventProviderAuthFailed
+		}
+	}
+	source := operationID
+	if source == "" {
+		source = action
+	}
+	state := string(event) + ":" + outcome
+	if !server.authTransition(source, action, state) {
+		return
+	}
+	server.config.Diagnostics.Emit(diagnosticlog.LevelInfo, diagnosticlog.ComponentAPI, event, diagnosticlog.Fields{
+		NodeID: string(envelope.NodeID), CommandID: commandID, OperationID: operationID, Operation: action, Outcome: outcome,
+	})
+}
+
+func (server *Server) authTransition(source, fallback, state string) bool {
+	if source == "" {
+		source = fallback
+	}
+	server.logMu.Lock()
+	defer server.logMu.Unlock()
+	if server.lastAuth == nil {
+		server.lastAuth = make(map[string]string)
+	}
+	if state == server.lastAuth[source] {
+		return false
+	}
+	if _, known := server.lastAuth[source]; !known && len(server.lastAuth) >= 4096 {
+		return false
+	}
+	server.lastAuth[source] = state
+	return true
+}
+
+func (server *Server) logReadiness(result node.Result) {
+	var health harnessprotocol.HealthReady
+	if (result.HTTPStatus != http.StatusOK && result.HTTPStatus != http.StatusServiceUnavailable) || json.Unmarshal(result.Body, &health) != nil ||
+		(health.Readiness != "ready" && health.Readiness != "blocked" && health.Readiness != "unknown") {
+		return
+	}
+	reason := ""
+	if len(health.BlockedReasons) > 0 {
+		reason = health.BlockedReasons[0]
+	}
+	readiness := string(health.Readiness)
+	key := readiness + ":" + reason
+	server.logMu.Lock()
+	if key == server.lastReadiness {
+		server.logMu.Unlock()
+		return
+	}
+	server.lastReadiness = key
+	server.logMu.Unlock()
+	server.config.Diagnostics.Emit(diagnosticlog.LevelInfo, diagnosticlog.ComponentAPI, diagnosticlog.EventReadinessChanged, diagnosticlog.Fields{
+		NodeID: server.config.NodeID, Outcome: readiness, Reason: reason,
+	})
 }
 
 func (server *Server) authenticate(writer http.ResponseWriter, request *http.Request) (node.TrustContext, bool) {
@@ -820,7 +917,9 @@ func (server *Server) ready(writer http.ResponseWriter, request *http.Request) {
 		writeResult(writer, server.node.Invalid("query is invalid"))
 		return
 	}
-	writeResult(writer, server.node.HealthReady(request.Context(), trust))
+	result := server.node.HealthReady(request.Context(), trust)
+	server.logReadiness(result)
+	writeResult(writer, result)
 }
 
 func (server *Server) identity(writer http.ResponseWriter, request *http.Request) {

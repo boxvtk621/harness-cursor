@@ -7,6 +7,7 @@ import (
 
 	"github.com/boxvtk621/harness-cursor/adapters/contract"
 	"github.com/boxvtk621/harness-cursor/contracts/wire"
+	"github.com/boxvtk621/harness-cursor/internal/diagnosticlog"
 )
 
 const actionDispatchStart = "dispatch.start"
@@ -150,6 +151,9 @@ func (node *Node) DispatchNext(ctx context.Context) (DispatchResult, error) {
 	if err := tx.Commit(); err != nil {
 		return DispatchResult{}, err
 	}
+	node.config.Diagnostics.Emit(diagnosticlog.LevelInfo, diagnosticlog.ComponentRuntime, diagnosticlog.EventAttemptDispatch, diagnosticlog.Fields{
+		NodeID: node.config.NodeID, DialogID: currentDialog, RequestID: currentRequest, AttemptID: attemptID, Generation: generation,
+	})
 	if err := node.checkFault(FaultAfterDispatchIntent); err != nil {
 		return DispatchResult{Outcome: "unknown", AttemptID: attemptID, RequestID: currentRequest}, err
 	}

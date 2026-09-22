@@ -58,6 +58,14 @@ type bridge struct {
 	wait      chan error
 	closeOne  sync.Once
 	nextID    atomic.Uint64
+	stderr    *byteCounter
+}
+
+type byteCounter struct{ total atomic.Uint64 }
+
+func (counter *byteCounter) Write(value []byte) (int, error) {
+	counter.total.Add(uint64(len(value)))
+	return len(value), nil
 }
 
 func startBridge(config Config, onEvent func(bridgeFrame), onRequest func(bridgeFrame), onExit func()) (*bridge, error) {
@@ -71,11 +79,12 @@ func startBridge(config Config, onEvent func(bridgeFrame), onRequest func(bridge
 	if err != nil {
 		return nil, err
 	}
-	command.Stderr = io.Discard
+	stderr := &byteCounter{}
+	command.Stderr = stderr
 	instance := &bridge{
 		cmd: command, stdin: stdin, maximum: config.MaxFrameBytes,
 		onEvent: onEvent, onRequest: onRequest, onExit: onExit, pending: make(map[string]chan bridgeResponse), inbound: make(map[string]struct{}),
-		done: make(chan struct{}), wait: make(chan error, 1),
+		done: make(chan struct{}), wait: make(chan error, 1), stderr: stderr,
 	}
 	if err := command.Start(); err != nil {
 		return nil, fmt.Errorf("start cursor worker: %w", err)
@@ -86,6 +95,13 @@ func startBridge(config Config, onEvent func(bridgeFrame), onRequest func(bridge
 		close(instance.wait)
 	}()
 	return instance, nil
+}
+
+func (bridge *bridge) suppressedStderrBytes() uint64 {
+	if bridge == nil || bridge.stderr == nil {
+		return 0
+	}
+	return bridge.stderr.total.Load()
 }
 
 func (bridge *bridge) respond(id string, result any, code string) error {
