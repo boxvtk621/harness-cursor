@@ -29,6 +29,7 @@ state/
 coverage/
 .provenance-source/
 _bmad/
+/output/
 
 .idea/
 .vscode/
