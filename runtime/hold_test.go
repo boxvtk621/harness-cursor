@@ -532,6 +532,9 @@ func TestHoldDoesNotCommitAcrossDurablePreStartIntent(t *testing.T) {
 	releaseDispatch := make(chan struct{})
 	opened.SetFaultInjector(func(point node.FaultPoint) error {
 		if point == node.FaultAfterDispatchIntent {
+			// A crash stops the executor too. Otherwise its heartbeat can claim
+			// the durable intent while this test is inspecting the crash boundary.
+			opened.StopExecutorForTesting()
 			intentCommitted <- struct{}{}
 			<-releaseDispatch
 			return errors.New("synthetic dispatch interruption")
