@@ -115,7 +115,7 @@ valid_readiness() {
     printf '%s' "$1" | grep -q '"auth_unavailable"' &&
     printf '%s' "$1" | grep -q '"kind":"cursor"' &&
     printf '%s' "$1" | grep -q '"version":"1.0.31"' &&
-    printf '%s' "$1" | grep -q '"schemaSHA256":"5bd97f2ea08854a8e56d46ff11a1539e6bc54e8ca6d42841b366561accba73d9"'
+    printf '%s' "$1" | grep -q '"schemaSHA256":"5013223c4f77ac7424a486d7223c5321eb7f0e9054fb036e48d6e7748fae1889"'
 }
 
 wait_readiness() {
