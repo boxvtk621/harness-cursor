@@ -259,6 +259,40 @@ test('real JsonlLocalAgentStore migrates only the expected legacy agent before r
   }
 });
 
+test('zero-turn native resume retains two old agent IDs and histories with replacement MCP B', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cursor-worker-mcp-restart-'));
+  try {
+    const store = new JsonlLocalAgentStore(join(root, 'sdk-store'));
+    const workspace = join(root, 'workspace');
+    const now = Date.now();
+    const ids = ['agent-10000000-0000-4000-8000-000000000011', 'agent-10000000-0000-4000-8000-000000000012'];
+    for (const [index, agentId] of ids.entries()) {
+      await store.agents.create({ agent: { agentId, cwd: workspace, status: 'idle', activeRunId: null, createdAt: now, updatedAt: now } });
+      await store.runs.create({ run: { runId: `run-${index}`, agentId, turnNumber: 1, status: 'finished', result: `history-${index}`, createdAt: now, updatedAt: now, startedAt: now, endedAt: now } });
+    }
+    const options = (mcpServers) => ({
+      apiKey: 'key', tools: ['mcp'], disallowedTools: ['shell', 'task'], mcpServers, agents: {},
+      local: { cwd: workspace, store, settingSources: [], customTools: {}, enableAgentRetries: false },
+    });
+    const a = { a: { type: 'http', url: 'http://127.0.0.1:8765/mcp/a' } };
+    const b = { b: { type: 'http', url: 'http://127.0.0.1:8765/mcp/b' } };
+    for (const agentId of ids) {
+      const previous = await Agent.resume(agentId, options(a));
+      assert.equal(previous.agentId, agentId);
+      previous.close();
+      const replacement = await Agent.resume(agentId, options(b));
+      assert.equal(replacement.agentId, agentId);
+      replacement.close();
+    }
+    for (const [index, agentId] of ids.entries()) {
+      assert.equal((await store.runs.get({ agentId, runId: `run-${index}` })).result, `history-${index}`);
+      assert.equal((await store.agents.get({ agentId })).agentId, agentId);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('custom tool waits for the harness response on the bidirectional bridge', async () => {
   const terminal = deferred();
   const { sdk, calls } = fakeSDK(terminal, [

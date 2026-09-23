@@ -306,7 +306,7 @@ export function createRuntime(sdk, emit, installedVersion = SDK_VERSION, injecte
     fs.mkdirSync(payload.stateDir, { recursive: true, mode: 0o700 });
 	config = { ...payload, model: typeof payload.model === 'string' ? { id: payload.model } : payload.model, mcpServers: payload.mcpServers || {}, apiKey };
     store = new sdk.JsonlLocalAgentStore(path.join(config.stateDir, 'sdk-store'));
-    response(id, { version: installedVersion });
+    response(id, { version: installedVersion, model: config.model, mcpServerIds: Object.keys(config.mcpServers).sort() });
   }
 
   async function models(id) {

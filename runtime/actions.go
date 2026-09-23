@@ -241,6 +241,10 @@ func (node *Node) performDispatch(ctx context.Context, action postCommitAction, 
 		node.requeueAction(action.commandID)
 		return
 	}
+	if native, ok := node.config.Adapter.(interface{ NativeReady() bool }); ok && !native.NativeReady() {
+		node.requeueAction(action.commandID)
+		return
+	}
 	node.mu.Lock()
 	var prompt, boundaryMessageID, revision, contentHash, toolHash, approvalMode, effectiveHash string
 	var boundarySequence int64

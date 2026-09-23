@@ -28,7 +28,13 @@ type dispatchCandidate struct {
 }
 
 func (node *Node) DispatchNext(ctx context.Context) (DispatchResult, error) {
+	if native, ok := node.config.Adapter.(interface{ NativeReady() bool }); ok && !native.NativeReady() {
+		return DispatchResult{Outcome: "blocked"}, nil
+	}
 	if node.config.ProviderAuth != nil && !node.config.ProviderAuth.ProviderAuthReady() {
+		return DispatchResult{Outcome: "blocked"}, nil
+	}
+	if native, ok := node.config.Adapter.(interface{ NativeReady() bool }); ok && !native.NativeReady() {
 		return DispatchResult{Outcome: "blocked"}, nil
 	}
 	candidate, err := node.peekDispatch(ctx)

@@ -58,7 +58,9 @@ type Snapshot struct {
 type Capabilities struct {
 	Provider      string `json:"provider"`
 	ModelCatalog  string `json:"modelCatalog"`
+	ModelDefault  string `json:"modelDefault"`
 	MCPCheck      string `json:"mcpCheck"`
+	MCPTimeout    string `json:"mcpTimeout"`
 	NativeRestart string `json:"nativeRestart"`
 }
 
@@ -158,6 +160,22 @@ type NativeModel struct {
 	DisplayName string
 	Parameters  []NativeParameter
 	Variants    []NativeVariant
+}
+
+// RuntimeConfig is the private, node-wide snapshot supplied to the native
+// child process. It must never be returned by a public API.
+type RuntimeConfig struct {
+	ModelID    string
+	Params     map[string]string
+	MCPServers []RuntimeMCPServer
+}
+
+type RuntimeMCPServer struct {
+	ID, URL, BearerToken string
+}
+
+type RuntimeApplier interface {
+	RestartSettings(context.Context, RuntimeConfig) (rollbackFailed bool, err error)
 }
 
 type CatalogSource interface {

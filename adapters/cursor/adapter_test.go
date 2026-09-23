@@ -929,16 +929,24 @@ import readline from 'node:readline';
 const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 const active = new Map();
 const pendingCancels = new Map();
+let currentModel = 'composer-2.5';
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\n');
 for await (const line of lines) {
   const frame = JSON.parse(line);
   const payload = frame.payload || {};
   if (frame.operation === 'init') {
+    if (payload.model?.id === 'reject-model') {
+      send({ type: 'response', id: frame.id, ok: false, code: 'rejected' });
+      continue;
+    }
     if (payload.model?.id === 'nil-config-contract' && (!Array.isArray(payload.model.params) || !payload.mcpServers || typeof payload.mcpServers !== 'object' || Array.isArray(payload.mcpServers))) {
       send({ type: 'response', id: frame.id, ok: false, code: 'rejected' });
       continue;
     }
-    send({ type: 'response', id: frame.id, ok: true, result: { version: '1.0.31' } });
+    currentModel = payload.model.id;
+    send({ type: 'response', id: frame.id, ok: true, result: { version: '1.0.31', model: payload.model, mcpServerIds: Object.keys(payload.mcpServers).sort() } });
+  } else if (frame.operation === 'models') {
+    send({ type: 'response', id: frame.id, ok: true, result: { models: [{ id: currentModel, displayName: currentModel, parameters: [], variants: [] }], revision: 'fake' } });
   } else if (frame.operation === 'dispatch') {
     if (payload.policyContent !== 'deny all tools' && payload.policyContent !== 'allow tools') {
       send({ type: 'response', id: frame.id, ok: false, code: 'rejected' });

@@ -39,6 +39,10 @@ func (node *Node) BeginProviderAuthTransition() (func(), bool) {
 
 func (node *Node) effectiveReadiness(readiness string, reasons []string) (string, []string) {
 	result := append(make([]string, 0, len(reasons)), reasons...)
+	if native, ok := node.config.Adapter.(interface{ NativeReady() bool }); ok && !native.NativeReady() {
+		readiness = "blocked"
+		result = addReason(result, "engine_unavailable")
+	}
 	if node.config.ProviderAuth != nil && !node.config.ProviderAuth.ProviderAuthReady() {
 		readiness = "blocked"
 		result = addReason(result, "auth_unavailable")

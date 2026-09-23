@@ -34,9 +34,85 @@ func NewManaged(config Config, artifacts node.ArtifactSink) (*Managed, error) {
 }
 
 func (managed *Managed) Prepare(secret string) (*Adapter, error) {
+	managed.mu.RLock()
 	config := managed.config
+	managed.mu.RUnlock()
 	config.APIKey = secret
 	return New(config, managed.artifacts)
+}
+
+func configured(base Config, settings nodesettings.RuntimeConfig) Config {
+	base.Model = settings.ModelID
+	base.ModelParams = make([]ModelParam, 0, len(settings.Params))
+	for id, value := range settings.Params {
+		base.ModelParams = append(base.ModelParams, ModelParam{ID: id, Value: value})
+	}
+	base.MCPServers = make(map[string]MCPServerConfig, len(settings.MCPServers))
+	for _, server := range settings.MCPServers {
+		entry := MCPServerConfig{Type: "http", URL: server.URL}
+		if server.BearerToken != "" {
+			entry.Headers = map[string]string{"Authorization": "Bearer " + server.BearerToken}
+		}
+		base.MCPServers[server.ID] = entry
+	}
+	return base
+}
+
+// ConfigureApplied is called before provider-auth bootstrap so a recreated
+// container starts only the last confirmed applied snapshot.
+func (managed *Managed) ConfigureApplied(settings nodesettings.RuntimeConfig) {
+	managed.mu.Lock()
+	managed.config = configured(managed.config, settings)
+	managed.mu.Unlock()
+}
+
+// RestartSettings runs with the runtime start gate held. The old worker is
+// reaped before the replacement is initialized against the persistent store.
+func (managed *Managed) RestartSettings(ctx context.Context, settings nodesettings.RuntimeConfig) (bool, error) {
+	managed.mu.Lock()
+	defer managed.mu.Unlock()
+	if managed.closed || managed.current == nil {
+		return false, errors.New("provider_auth_required")
+	}
+	oldConfig := managed.current.config
+	nextConfig := configured(oldConfig, settings)
+	prior := managed.current
+	managed.current = nil
+	_ = prior.Close() // Kill status is expected; Close has reaped the child.
+	var restartErr error
+	if ctx.Err() == nil {
+		candidate, err := New(nextConfig, managed.artifacts)
+		if err == nil {
+			models, _, catalogErr := candidate.Models(ctx)
+			verified := false
+			for _, model := range models {
+				if model.ID == settings.ModelID {
+					verified = true
+				}
+			}
+			if catalogErr == nil && verified {
+				managed.current, managed.config = candidate, configured(managed.config, settings)
+				return false, nil
+			}
+			_ = candidate.Close()
+			if catalogErr != nil {
+				err = catalogErr
+			} else {
+				err = errors.New("model_unavailable")
+			}
+		}
+		restartErr = err
+	} else {
+		restartErr = ctx.Err()
+	}
+	// Exactly one controlled rollback attempt. Keep the node available for
+	// settings reads even if the provider cannot be brought back.
+	restored, rollbackErr := New(oldConfig, managed.artifacts)
+	if rollbackErr != nil {
+		return true, errors.Join(restartErr, rollbackErr)
+	}
+	managed.current = restored
+	return false, restartErr
 }
 
 func (managed *Managed) Swap(replacement *Adapter) error {
@@ -101,6 +177,12 @@ func (managed *Managed) adapter() (*Adapter, error) {
 		return nil, errors.New("cursor provider authentication is unavailable")
 	}
 	return managed.current, nil
+}
+
+func (managed *Managed) NativeReady() bool {
+	managed.mu.RLock()
+	defer managed.mu.RUnlock()
+	return !managed.closed && managed.current != nil
 }
 
 func (managed *Managed) Models(ctx context.Context) ([]nodesettings.NativeModel, string, error) {

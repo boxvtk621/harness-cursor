@@ -154,6 +154,15 @@ func serve(ctx context.Context, path string, diagnostics *diagnosticlog.Logger) 
 		return withStartupStage("provider_runtime_open_failed", err)
 	}
 	defer adapter.Close()
+	initialModel := cfg.Cursor.Model
+	if initialModel == "" {
+		initialModel = "composer-2.5"
+	}
+	settings, err := nodesettings.Open(cfg.NodeID, cfg.Cursor.StateDir, harnessadapter.CursorSDKVersion, initialModel, adapter.(nodesettings.CatalogSource))
+	if err != nil {
+		return withStartupStage("node_settings_open_failed", err)
+	}
+	adapter.(*cursor.Managed).ConfigureApplied(settings.AppliedRuntimeConfig())
 	// Establish provider truth before the node action loop can admit queued work.
 	// A transient probe failure deliberately leaves auth unknown and readiness
 	// blocked while still allowing the private auth API to recover it later.
@@ -171,14 +180,7 @@ func serve(ctx context.Context, path string, diagnostics *diagnosticlog.Logger) 
 	defer authority.Close()
 	authBackend.SetBusy(authority.Busy)
 	auth.SetTransitionGate(authority.BeginProviderAuthTransition)
-	initialModel := cfg.Cursor.Model
-	if initialModel == "" {
-		initialModel = "composer-2.5"
-	}
-	settings, err := nodesettings.Open(cfg.NodeID, cfg.Cursor.StateDir, harnessadapter.CursorSDKVersion, initialModel, adapter.(nodesettings.CatalogSource))
-	if err != nil {
-		return withStartupStage("node_settings_open_failed", err)
-	}
+	settings.BindRuntime(authority.BeginProviderAuthTransition, authority.Busy, adapter.(*cursor.Managed))
 	handler, err := harnessserver.New(harnessserver.Config{NodeID: cfg.NodeID, ProviderAuth: auth, NodeSettings: settings, Diagnostics: diagnostics}, authority)
 	if err != nil {
 		return withStartupStage("api_handler_open_failed", err)

@@ -146,7 +146,7 @@ func TestNodeSettingsRoutesAreStrictCASAndSecretIsWriteOnly(t *testing.T) {
 		t.Fatalf("GET settings status=%d body=%s", response.StatusCode, raw)
 	}
 
-	body := `{"expectedRevision":1,"draft":{"mcpServers":[{"id":"docs","name":"Docs","enabled":true,"transport":"streamable_http","url":"https://example.test/mcp","timeoutMs":5000,"auth":{"kind":"bearer","secretAction":"replace","secret":"write-only"}}],"inference":{"modelId":null,"speedMode":null,"reasoningEffort":null}}}`
+	body := `{"expectedRevision":1,"draft":{"mcpServers":[{"id":"docs","name":"Docs","enabled":true,"transport":"streamable_http","url":"http://127.0.0.1:1/mcp","timeoutMs":5000,"auth":{"kind":"bearer","secretAction":"replace","secret":"write-only"}}],"inference":{"modelId":null,"speedMode":null,"reasoningEffort":null}}}`
 	request, _ := http.NewRequest(http.MethodPut, endpoint.URL+"/v1/nodes/"+testNodeID+"/settings", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	response, err = http.DefaultClient.Do(request)
@@ -198,7 +198,7 @@ func TestNodeSettingsRoutesAreStrictCASAndSecretIsWriteOnly(t *testing.T) {
 	}
 	raw, _ = io.ReadAll(response.Body)
 	response.Body.Close()
-	if response.StatusCode != http.StatusAccepted || !strings.Contains(string(raw), `"reasonCode":"managed_restart_coordination_unavailable"`) || !strings.Contains(string(raw), `"appliedRevision":1`) {
+	if response.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(raw), `"code":"settings_unavailable"`) {
 		t.Fatalf("apply status=%d body=%s", response.StatusCode, raw)
 	}
 }

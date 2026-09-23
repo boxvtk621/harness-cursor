@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -132,6 +133,11 @@ func New(config Config, artifacts node.ArtifactSink) (*Adapter, error) {
 	defer cancel()
 	var initialized struct {
 		Version string `json:"version"`
+		Model   struct {
+			ID     string       `json:"id"`
+			Params []ModelParam `json:"params"`
+		} `json:"model"`
+		MCPServerIDs []string `json:"mcpServerIds"`
 	}
 	modelParams := config.ModelParams
 	if modelParams == nil {
@@ -145,7 +151,12 @@ func New(config Config, artifacts node.ArtifactSink) (*Adapter, error) {
 		"model": map[string]any{"id": config.Model, "params": modelParams}, "mcpServers": mcpServers, "stateDir": config.StateDir,
 		"maxFrameBytes": config.MaxFrameBytes,
 	}, &initialized)
-	if err != nil || initialized.Version != harnessadapter.CursorSDKVersion {
+	expectedIDs := make([]string, 0, len(mcpServers))
+	for id := range mcpServers {
+		expectedIDs = append(expectedIDs, id)
+	}
+	slices.Sort(expectedIDs)
+	if err != nil || initialized.Version != harnessadapter.CursorSDKVersion || initialized.Model.ID != config.Model || !slices.Equal(initialized.MCPServerIDs, expectedIDs) || !sameModelParams(initialized.Model.Params, modelParams) {
 		_ = worker.Close()
 		if err != nil {
 			return nil, fmt.Errorf("initialize cursor worker: %w", err)
@@ -154,6 +165,22 @@ func New(config Config, artifacts node.ArtifactSink) (*Adapter, error) {
 	}
 	adapter.config.Diagnostics.Emit(diagnosticlog.LevelInfo, diagnosticlog.ComponentProvider, diagnosticlog.EventProviderReady, diagnosticlog.Fields{Operation: "init"})
 	return adapter, nil
+}
+
+func sameModelParams(left, right []ModelParam) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	values := make(map[string]string, len(left))
+	for _, item := range left {
+		values[item.ID] = item.Value
+	}
+	for _, item := range right {
+		if values[item.ID] != item.Value {
+			return false
+		}
+	}
+	return true
 }
 
 func (adapter *Adapter) Models(ctx context.Context) ([]nodesettings.NativeModel, string, error) {

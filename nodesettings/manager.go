@@ -20,6 +20,7 @@ import (
 )
 
 const maximumServers = 50
+const nativeMCPTimeoutMetadataMS = 30000
 
 var (
 	identifierPattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
@@ -42,9 +43,10 @@ type privateSnapshot struct {
 }
 
 type operationRecord struct {
-	Operation        Operation `json:"operation"`
-	ExpectedRevision int64     `json:"expectedRevision"`
-	TargetRevision   int64     `json:"targetRevision"`
+	Operation        Operation       `json:"operation"`
+	ExpectedRevision int64           `json:"expectedRevision"`
+	TargetRevision   int64           `json:"targetRevision"`
+	Target           privateSnapshot `json:"target"`
 }
 
 type diskState struct {
@@ -61,6 +63,10 @@ type Manager struct {
 	mu                           sync.Mutex
 	state                        diskState
 	now                          func() time.Time
+	beginTransition              func() (func(), bool)
+	busy                         func() bool
+	applier                      RuntimeApplier
+	applyTimeout                 time.Duration
 }
 
 func Open(nodeID, stateDir, runtimeVersion, initialModel string, source CatalogSource) (*Manager, error) {
@@ -78,12 +84,59 @@ func Open(nodeID, stateDir, runtimeVersion, initialModel string, source CatalogS
 			return nil, errors.New("node settings state is invalid")
 		}
 		manager.state = loaded
+		// The child is recreated from Applied on startup. A pending operation
+		// may have crossed any restart boundary and must never be replayed.
+		for id, record := range manager.state.Operations {
+			if record.Operation.Status == "pending" {
+				record.Operation.Status = "failed"
+				record.Operation.ReasonCode = "apply_interrupted"
+				record.Operation.UpdatedAt = manager.now().UTC().Format(time.RFC3339Nano)
+				manager.state.Operations[id] = record
+			}
+		}
+		if err := manager.persistLocked(); err != nil {
+			return nil, err
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	} else if err := manager.persistLocked(); err != nil {
 		return nil, err
 	}
 	return manager, nil
+}
+
+// BindRuntime connects the durable settings service to the same start gate
+// used by dispatch and provider authentication.
+func (manager *Manager) BindRuntime(begin func() (func(), bool), busy func() bool, applier RuntimeApplier) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	manager.beginTransition, manager.busy, manager.applier = begin, busy, applier
+	manager.applyTimeout = 2 * time.Minute
+}
+
+func (manager *Manager) AppliedRuntimeConfig() RuntimeConfig {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	return runtimeConfig(manager.state.Applied)
+}
+
+func runtimeConfig(snapshot privateSnapshot) RuntimeConfig {
+	result := RuntimeConfig{Params: map[string]string{}, MCPServers: []RuntimeMCPServer{}}
+	if snapshot.Inference.ModelID != nil {
+		result.ModelID = *snapshot.Inference.ModelID
+	}
+	if snapshot.Inference.SpeedMode != nil {
+		result.Params["fast"] = *snapshot.Inference.SpeedMode
+	}
+	if snapshot.Inference.ReasoningEffort != nil {
+		result.Params["reasoning_effort"] = *snapshot.Inference.ReasoningEffort
+	}
+	for _, server := range snapshot.MCPServers {
+		if server.Enabled {
+			result.MCPServers = append(result.MCPServers, RuntimeMCPServer{ID: server.ID, URL: server.URL, BearerToken: server.BearerToken})
+		}
+	}
+	return result
 }
 
 func (manager *Manager) Snapshot(ctx context.Context, nodeID string) (Envelope, *APIError) {
@@ -137,10 +190,38 @@ func (manager *Manager) ModelCatalog(ctx context.Context, nodeID string) (Catalo
 	catalog.State, catalog.CatalogRevision = "fresh", revision
 	for _, item := range native {
 		model := Model{ID: item.ID, DisplayName: item.DisplayName, ReasoningEfforts: []Mode{}, SpeedModes: []Mode{}}
+		for _, parameter := range item.Parameters {
+			if parameter.ID != "fast" && parameter.ID != "reasoning_effort" {
+				continue
+			}
+			seen := map[string]bool{}
+			for _, variant := range item.Variants {
+				value, ok := variant.Params[parameter.ID]
+				if !ok || seen[value] || !contains(parameter.Values, value) {
+					continue
+				}
+				seen[value] = true
+				mode := Mode{ID: value, IsDefault: variant.IsDefault}
+				if parameter.ID == "fast" {
+					model.SpeedModes = append(model.SpeedModes, mode)
+				} else {
+					model.ReasoningEfforts = append(model.ReasoningEfforts, mode)
+				}
+			}
+		}
 		catalog.Models = append(catalog.Models, model)
 	}
 	sort.Slice(catalog.Models, func(i, j int) bool { return catalog.Models[i].ID < catalog.Models[j].ID })
 	return catalog, nil
+}
+
+func contains(values []string, value string) bool {
+	for _, item := range values {
+		if item == value {
+			return true
+		}
+	}
+	return false
 }
 
 func (manager *Manager) CheckMCP(ctx context.Context, nodeID string, request MCPCheckRequest) (MCPCheck, *APIError) {
@@ -148,18 +229,30 @@ func (manager *Manager) CheckMCP(ctx context.Context, nodeID string, request MCP
 		return MCPCheck{}, &APIError{Status: http.StatusBadRequest, Code: "invalid_request"}
 	}
 	manager.mu.Lock()
-	defer manager.mu.Unlock()
 	if request.ExpectedRevision != manager.state.DraftRevision {
+		manager.mu.Unlock()
 		return MCPCheck{}, &APIError{Status: http.StatusConflict, Code: "revision_conflict"}
 	}
+	var selected privateMCP
 	found := false
 	for _, server := range manager.state.Draft.MCPServers {
-		found = found || server.ID == request.MCPServerID
+		if server.ID == request.MCPServerID {
+			selected, found = server, true
+			break
+		}
 	}
+	manager.mu.Unlock()
 	if !found {
 		return MCPCheck{}, notFound()
 	}
-	return MCPCheck{SchemaID: SchemaID, NodeID: nodeID, MCPServerID: request.MCPServerID, CheckedAt: manager.now().UTC().Format(time.RFC3339Nano), State: "unsupported", ReasonCode: "zero_turn_mcp_check_unavailable"}, nil
+	check := MCPCheck{SchemaID: SchemaID, NodeID: nodeID, MCPServerID: request.MCPServerID, CheckedAt: manager.now().UTC().Format(time.RFC3339Nano)}
+	count, reason := probeMCP(ctx, selected)
+	if reason != "" {
+		check.State, check.ReasonCode = "unavailable", reason
+	} else {
+		check.State, check.ToolsCount = "connected", &count
+	}
+	return check, nil
 }
 
 func (manager *Manager) Apply(ctx context.Context, nodeID string, request CommandRequest) (Envelope, *APIError) {
@@ -178,14 +271,160 @@ func (manager *Manager) Apply(ctx context.Context, nodeID string, request Comman
 	if request.ExpectedRevision != manager.state.DraftRevision || request.TargetRevision != manager.state.DraftRevision {
 		return Envelope{}, &APIError{Status: http.StatusConflict, Code: "revision_conflict"}
 	}
+	if manager.applier == nil || manager.beginTransition == nil {
+		return Envelope{}, unavailable()
+	}
+	for _, record := range manager.state.Operations {
+		if record.Operation.Status == "pending" {
+			return Envelope{}, &APIError{Status: http.StatusConflict, Code: "apply_in_progress"}
+		}
+	}
 	now := manager.now().UTC().Format(time.RFC3339Nano)
-	operation := Operation{OperationID: randomID(), CommandID: request.CommandID, TargetRevision: manager.state.DraftRevision, PreviousRevision: manager.state.AppliedRevision, Status: "failed", Phase: "preflight", ReasonCode: "managed_restart_coordination_unavailable", CreatedAt: now, UpdatedAt: now}
-	manager.state.Operations[request.CommandID] = operationRecord{Operation: operation, ExpectedRevision: request.ExpectedRevision, TargetRevision: request.TargetRevision}
+	operation := Operation{OperationID: randomID(), CommandID: request.CommandID, TargetRevision: manager.state.DraftRevision, PreviousRevision: manager.state.AppliedRevision, Status: "pending", Phase: "preflight", CreatedAt: now, UpdatedAt: now}
+	manager.state.Operations[request.CommandID] = operationRecord{Operation: operation, ExpectedRevision: request.ExpectedRevision, TargetRevision: request.TargetRevision, Target: manager.state.Draft}
 	if err := manager.persistLocked(); err != nil {
 		delete(manager.state.Operations, request.CommandID)
 		return Envelope{}, unavailable()
 	}
+	go manager.executeApply(request.CommandID)
 	return manager.envelopeLocked(&operation), nil
+}
+
+func (manager *Manager) updateOperation(commandID, status, phase, reason string, applied *privateSnapshot) error {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	oldRecord := manager.state.Operations[commandID]
+	oldApplied, oldRevision := manager.state.Applied, manager.state.AppliedRevision
+	record := oldRecord
+	record.Operation.Status, record.Operation.Phase, record.Operation.ReasonCode = status, phase, reason
+	record.Operation.UpdatedAt = manager.now().UTC().Format(time.RFC3339Nano)
+	manager.state.Operations[commandID] = record
+	if applied != nil {
+		manager.state.Applied, manager.state.AppliedRevision = *applied, record.TargetRevision
+	}
+	if err := manager.persistLocked(); err != nil {
+		manager.state.Applied, manager.state.AppliedRevision = oldApplied, oldRevision
+		oldRecord.Operation.Status, oldRecord.Operation.Phase = "failed", phase
+		oldRecord.Operation.ReasonCode = "settings_unavailable"
+		oldRecord.Operation.UpdatedAt = record.Operation.UpdatedAt
+		manager.state.Operations[commandID] = oldRecord
+		return err
+	}
+	return nil
+}
+
+func (manager *Manager) executeApply(commandID string) {
+	manager.mu.Lock()
+	record := manager.state.Operations[commandID]
+	previous := manager.state.Applied
+	begin, busyProbe, applier, timeout := manager.beginTransition, manager.busy, manager.applier, manager.applyTimeout
+	manager.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := manager.validateRuntime(ctx, record.Target); err != nil {
+		_ = manager.updateOperation(commandID, "failed", "preflight", err.Error(), nil)
+		return
+	}
+	// Acquiring the gate also waits for any existing credential transition or
+	// native Start/Resume. Completion and approval handling do not take it.
+	release, busy := begin()
+	defer release()
+	if err := manager.validateRuntime(ctx, record.Target); err != nil {
+		_ = manager.updateOperation(commandID, "failed", "preflight", err.Error(), nil)
+		return
+	}
+	if manager.updateOperation(commandID, "pending", "draining", "", nil) != nil {
+		return
+	}
+	for busy {
+		select {
+		case <-ctx.Done():
+			_ = manager.updateOperation(commandID, "failed", "draining", "drain_timeout", nil)
+			return
+		case <-time.After(100 * time.Millisecond):
+			busy = busyProbe()
+		}
+	}
+	if manager.updateOperation(commandID, "pending", "restarting", "", nil) != nil {
+		return
+	}
+	rollbackFailed, err := applier.RestartSettings(ctx, runtimeConfig(record.Target))
+	if err != nil {
+		reason := "native_restart_failed"
+		if rollbackFailed {
+			reason = "rollback_failed"
+		}
+		_ = manager.updateOperation(commandID, "failed", "restarting", reason, nil)
+		return
+	}
+	if manager.updateOperation(commandID, "pending", "verifying", "", nil) == nil {
+		if manager.updateOperation(commandID, "succeeded", "complete", "", &record.Target) == nil {
+			return
+		}
+	}
+	// A success that cannot be durably recorded is not an applied revision.
+	// Restore the previously confirmed worker while the dispatch gate is held.
+	failed, err := applier.RestartSettings(context.Background(), runtimeConfig(previous))
+	reason := "settings_unavailable"
+	if failed || err != nil {
+		reason = "rollback_failed"
+	}
+	_ = manager.updateOperation(commandID, "failed", "verifying", reason, nil)
+}
+
+func (manager *Manager) validateRuntime(ctx context.Context, target privateSnapshot) error {
+	if target.Inference.ModelID == nil {
+		// Cursor SDK 1.0.31 requires a concrete ModelSelection.id. Null is
+		// not a verified provider-default choice for this runtime.
+		return errors.New("model_default_unsupported")
+	}
+	for _, server := range target.MCPServers {
+		if server.Enabled && server.TimeoutMS != nativeMCPTimeoutMetadataMS {
+			// SDK 1.0.31 accepts URL and headers, but has no timeout field.
+			// The standard value remains policy metadata, not a native claim.
+			return errors.New("mcp_timeout_unsupported")
+		}
+	}
+	if manager.catalogSource == nil {
+		return errors.New("catalog_unavailable")
+	}
+	models, _, err := manager.catalogSource.Models(ctx)
+	if err != nil {
+		return errors.New("catalog_unavailable")
+	}
+	config := runtimeConfig(target)
+	for _, model := range models {
+		if model.ID != config.ModelID {
+			continue
+		}
+		if len(config.Params) == 0 {
+			return nil
+		}
+		for paramID, value := range config.Params {
+			found := false
+			for _, parameter := range model.Parameters {
+				if parameter.ID == paramID && contains(parameter.Values, value) {
+					found = true
+				}
+			}
+			if !found {
+				return errors.New("model_parameter_unsupported")
+			}
+		}
+		for _, variant := range model.Variants {
+			matches := true
+			for key, value := range config.Params {
+				if variant.Params[key] != value {
+					matches = false
+				}
+			}
+			if matches {
+				return nil
+			}
+		}
+		return errors.New("model_parameters_incompatible")
+	}
+	return errors.New("model_unavailable")
 }
 
 func (manager *Manager) Operation(ctx context.Context, nodeID, operationID string) (Envelope, *APIError) {
@@ -216,7 +455,7 @@ func decodeDiskState(raw []byte, target *diskState) error {
 }
 
 func validDiskState(state diskState) bool {
-	if state.DraftRevision < 1 || state.AppliedRevision < 1 || state.AppliedRevision > state.DraftRevision ||
+	if state.DraftRevision < 1 || state.AppliedRevision < 1 || state.AppliedRevision > state.DraftRevision || state.Applied.Inference.ModelID == nil ||
 		state.Operations == nil || len(state.Operations) > 4096 || !validPrivateSnapshot(state.Draft) || !validPrivateSnapshot(state.Applied) {
 		return false
 	}
@@ -224,6 +463,7 @@ func validDiskState(state diskState) bool {
 		operation := record.Operation
 		if !identifierPattern.MatchString(commandID) || operation.CommandID != commandID || !uuidPattern.MatchString(operation.OperationID) ||
 			record.ExpectedRevision < 1 || record.TargetRevision < 1 || operation.TargetRevision != record.TargetRevision ||
+			!validPrivateSnapshot(record.Target) ||
 			operation.PreviousRevision < 1 || !validOperationStatus(operation.Status) || !validOperationPhase(operation.Phase) ||
 			operation.ReasonCode != "" && !identifierPattern.MatchString(operation.ReasonCode) ||
 			operation.CreatedAt == "" || operation.UpdatedAt == "" {
@@ -334,11 +574,23 @@ func validateDraft(input Snapshot, previous privateSnapshot) (privateSnapshot, *
 }
 
 func (manager *Manager) envelopeLocked(operation *Operation) Envelope {
+	if operation == nil {
+		for _, record := range manager.state.Operations {
+			if operation == nil || record.Operation.CreatedAt > operation.CreatedAt {
+				latest := record.Operation
+				operation = &latest
+			}
+		}
+	}
 	state := "unavailable"
 	if manager.catalogSource != nil {
 		state = "available"
 	}
-	return Envelope{SchemaID: SchemaID, NodeID: manager.nodeID, DraftRevision: manager.state.DraftRevision, AppliedRevision: manager.state.AppliedRevision, Draft: publicSnapshot(manager.state.Draft), Applied: publicSnapshot(manager.state.Applied), Capabilities: Capabilities{Provider: "cursor", ModelCatalog: state, MCPCheck: "unsupported", NativeRestart: "unsupported"}, Operation: operation}
+	restart := "unsupported"
+	if manager.beginTransition != nil && manager.applier != nil {
+		restart = "supported"
+	}
+	return Envelope{SchemaID: SchemaID, NodeID: manager.nodeID, DraftRevision: manager.state.DraftRevision, AppliedRevision: manager.state.AppliedRevision, Draft: publicSnapshot(manager.state.Draft), Applied: publicSnapshot(manager.state.Applied), Capabilities: Capabilities{Provider: "cursor", ModelCatalog: state, ModelDefault: "unsupported", MCPCheck: "supported", MCPTimeout: "unsupported", NativeRestart: restart}, Operation: operation}
 }
 
 func publicSnapshot(input privateSnapshot) Snapshot {
