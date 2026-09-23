@@ -8,7 +8,7 @@ process.env.CURSOR_API_KEY = 'key';
 import { Agent, AgentNotFoundError, JsonlLocalAgentStore } from '@cursor/sdk';
 import {
   agentOptions, createCustomTools, createRuntime, installedSDKVersion, migrateLegacyAgentWorkspace,
-  safeUsage, MAX_PENDING_EXECUTIONS, MAX_PENDING_EXECUTIONS_PER_ATTEMPT, SDK_VERSION,
+  safeUsage, sanitizeModels, MAX_PENDING_EXECUTIONS, MAX_PENDING_EXECUTIONS_PER_ATTEMPT, SDK_VERSION,
 } from './worker.mjs';
 
 function deferred() {
@@ -28,7 +28,7 @@ function fakeSDK(terminal, streamMessages = []) {
     async steer(text) { calls.push(['steer', text]); return 'complete_delivered'; },
     async cancel() { calls.push(['cancel']); },
   };
-  const agent = { agentId: 'agent-1', async send(text) { calls.push(['send', text]); return run; }, close() { calls.push(['close']); } };
+  const agent = { agentId: 'agent-1', async send(text, options) { calls.push(['send', text, options]); return run; }, close() { calls.push(['close']); } };
   return {
     calls,
     sdk: {
@@ -122,7 +122,10 @@ test('dispatch acknowledges before terminal and controls remain concurrent', asy
   assert.equal(Object.hasOwn(calls[0][1], 'systemPrompt'), false);
   assert.equal(calls[0][1].local.cwd, '/workspace/dialog');
   assert.deepEqual(calls[0][1].local.customTools, {});
-  assert.deepEqual(calls[1], ['send', 'Chat guidance (user-level):\nstart policy\n\nUser message:\nhello']);
+  assert.equal(calls[1][0], 'send');
+  assert.equal(calls[1][1], 'Chat guidance (user-level):\nstart policy\n\nUser message:\nhello');
+  assert.deepEqual(calls[1][2].model, { id: 'model' });
+  assert.deepEqual(calls[1][2].mcpServers, {});
   await runtime.handle({ type: 'request', id: '3', operation: 'steer', payload: { attemptKey: 'attempt', runId: 'run-1', text: 'more' } });
   await runtime.handle({ type: 'request', id: '4', operation: 'cancel', payload: { attemptKey: 'attempt', runId: 'run-1' } });
   assert.deepEqual(calls.slice(-2), [['steer', 'more'], ['cancel']]);
@@ -161,8 +164,46 @@ test('resume reapplies the exact private agent id and fail-closed tool boundary'
       enableAgentRetries: false,
     },
   });
-  assert.deepEqual(calls[1], ['send', 'Chat guidance (user-level):\nresume policy\n\nUser message:\nnext']);
+  assert.equal(calls[1][0], 'send');
+  assert.equal(calls[1][1], 'Chat guidance (user-level):\nresume policy\n\nUser message:\nnext');
+  assert.deepEqual(calls[1][2].mcpServers, {});
   terminal.resolve({ status: 'finished', result: 'done' });
+});
+
+test('native MCP and model parameters are reapplied on resume and send', async () => {
+  const terminal = deferred();
+  const { sdk, calls } = fakeSDK(terminal);
+  const runtime = createRuntime(sdk, () => {});
+  const model = { id: 'catalog-model', params: [{ id: 'fast', value: 'true' }] };
+  const mcpServers = { docs: { type: 'http', url: 'https://example.test/mcp', headers: { Authorization: 'Bearer secret' } } };
+  await runtime.handle({ type: 'request', id: '1', operation: 'init', payload: { model, mcpServers, stateDir: '/tmp/cursor-worker-settings-test', maxFrameBytes: 65536 } });
+  await runtime.handle({ type: 'request', id: '2', operation: 'dispatch', payload: { attemptKey: 'attempt', prompt: 'next', policyContent: 'policy', workspace: '/workspace/dialog', approvalMode: 'deny', resumeAgentId: 'agent-old' } });
+  assert.equal(calls[0][0], 'resume');
+  assert.equal(calls[0][1], 'agent-old');
+  assert.deepEqual(calls[0][2].model, model);
+  assert.deepEqual(calls[0][2].mcpServers, mcpServers);
+  assert.deepEqual(calls[0][2].tools, ['mcp']);
+  assert.deepEqual(calls[1][2].model, model);
+  assert.deepEqual(calls[1][2].mcpServers, mcpServers);
+  terminal.resolve({ status: 'finished', result: 'done' });
+});
+
+test('configured native MCP tool events are consumed without failing the run', async () => {
+  const terminal = deferred();
+  const { sdk } = fakeSDK(terminal, [{ type: 'tool_call', name: 'mcp', args: { providerIdentifier: 'docs', toolName: 'search' } }]);
+  const output = [];
+  const runtime = createRuntime(sdk, (line) => output.push(JSON.parse(line)));
+  await runtime.handle({ type: 'request', id: '1', operation: 'init', payload: { model: { id: 'model' }, mcpServers: { docs: { type: 'http', url: 'https://example.test/mcp' } }, stateDir: '/tmp/cursor-worker-native-event-test', maxFrameBytes: 65536 } });
+  await runtime.handle({ type: 'request', id: '2', operation: 'dispatch', payload: { attemptKey: 'attempt', prompt: 'next', policyContent: 'policy', workspace: '/workspace/dialog', approvalMode: 'deny', resumeAgentId: 'agent-old' } });
+  terminal.resolve({ status: 'finished', result: 'done' });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(output.at(-1).event, 'terminal');
+  assert.equal(output.at(-1).status, 'finished');
+});
+
+test('model catalog preserves only authenticated SDK values', () => {
+  assert.deepEqual(sanitizeModels([{ id: 'm', displayName: 'Model', parameters: [{ id: 'fast', values: [{ value: 'true', displayName: 'Fast' }] }], variants: [{ displayName: 'Fast', params: [{ id: 'fast', value: 'true' }], isDefault: true }] }]), [{ id: 'm', displayName: 'Model', parameters: [{ id: 'fast', values: [{ value: 'true' }] }], variants: [{ params: [{ id: 'fast', value: 'true' }], isDefault: true }] }]);
+  assert.throws(() => sanitizeModels([{ id: 'm', displayName: 'Model', parameters: [{ id: 'fast', values: [{ value: '' }] }] }]), /model_catalog_invalid/);
 });
 
 test('real JsonlLocalAgentStore migrates only the expected legacy agent before resume', async () => {

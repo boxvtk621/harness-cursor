@@ -18,6 +18,7 @@ import (
 	"github.com/boxvtk621/harness-cursor/adapters/contract"
 	"github.com/boxvtk621/harness-cursor/contracts/wire"
 	"github.com/boxvtk621/harness-cursor/internal/diagnosticlog"
+	"github.com/boxvtk621/harness-cursor/nodesettings"
 	"github.com/boxvtk621/harness-cursor/runtime"
 	"github.com/boxvtk621/harness-cursor/tools"
 )
@@ -49,10 +50,23 @@ type Config struct {
 	WorkingDir       string
 	APIKey           string
 	Model            string
+	ModelParams      []ModelParam
+	MCPServers       map[string]MCPServerConfig
 	OperationTimeout time.Duration
 	MaxFrameBytes    int
 	ToolRunner       toolrunner.Runner
 	Diagnostics      *diagnosticlog.Logger
+}
+
+type ModelParam struct {
+	ID    string `json:"id"`
+	Value string `json:"value"`
+}
+
+type MCPServerConfig struct {
+	Type    string            `json:"type"`
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // Adapter owns the Cursor agent/run references. Only AttemptRef values cross
@@ -120,7 +134,7 @@ func New(config Config, artifacts node.ArtifactSink) (*Adapter, error) {
 		Version string `json:"version"`
 	}
 	err = worker.call(ctx, "init", map[string]any{
-		"model": config.Model, "stateDir": config.StateDir,
+		"model": map[string]any{"id": config.Model, "params": config.ModelParams}, "mcpServers": config.MCPServers, "stateDir": config.StateDir,
 		"maxFrameBytes": config.MaxFrameBytes,
 	}, &initialized)
 	if err != nil || initialized.Version != harnessadapter.CursorSDKVersion {
@@ -132,6 +146,50 @@ func New(config Config, artifacts node.ArtifactSink) (*Adapter, error) {
 	}
 	adapter.config.Diagnostics.Emit(diagnosticlog.LevelInfo, diagnosticlog.ComponentProvider, diagnosticlog.EventProviderReady, diagnosticlog.Fields{Operation: "init"})
 	return adapter, nil
+}
+
+func (adapter *Adapter) Models(ctx context.Context) ([]nodesettings.NativeModel, string, error) {
+	operationCtx, cancel := adapter.operationContext(ctx)
+	defer cancel()
+	var response struct {
+		Models []struct {
+			ID, DisplayName string
+			Parameters      []struct {
+				ID     string
+				Values []struct {
+					Value string `json:"value"`
+				}
+			} `json:"parameters"`
+			Variants []struct {
+				Params    []ModelParam `json:"params"`
+				IsDefault bool         `json:"isDefault"`
+			} `json:"variants"`
+		} `json:"models"`
+		Revision string `json:"revision"`
+	}
+	if err := adapter.bridge.call(operationCtx, "models", map[string]any{}, &response); err != nil {
+		return nil, "", err
+	}
+	models := make([]nodesettings.NativeModel, 0, len(response.Models))
+	for _, item := range response.Models {
+		model := nodesettings.NativeModel{ID: item.ID, DisplayName: item.DisplayName}
+		for _, parameter := range item.Parameters {
+			native := nodesettings.NativeParameter{ID: parameter.ID}
+			for _, value := range parameter.Values {
+				native.Values = append(native.Values, value.Value)
+			}
+			model.Parameters = append(model.Parameters, native)
+		}
+		for _, variant := range item.Variants {
+			native := nodesettings.NativeVariant{Params: make(map[string]string), IsDefault: variant.IsDefault}
+			for _, parameter := range variant.Params {
+				native.Params[parameter.ID] = parameter.Value
+			}
+			model.Variants = append(model.Variants, native)
+		}
+		models = append(models, model)
+	}
+	return models, response.Revision, nil
 }
 
 func (adapter *Adapter) Identity(context.Context) (harnessadapter.Identity, error) {

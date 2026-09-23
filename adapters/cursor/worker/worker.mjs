@@ -46,12 +46,13 @@ export function installedSDKVersion() {
 
 export function agentOptions(config, store, workspace = config.stateDir, customTools = {}) {
   const exposesCustomTools = Object.keys(customTools).length > 0;
+  const exposesMcp = exposesCustomTools || Object.keys(config.mcpServers || {}).length > 0;
   return {
     apiKey: config.apiKey,
-    model: { id: config.model },
-    tools: exposesCustomTools ? ['mcp'] : [],
+    model: typeof config.model === 'string' ? { id: config.model } : config.model,
+    tools: exposesMcp ? ['mcp'] : [],
     disallowedTools: ['shell', 'task'],
-    mcpServers: {},
+    mcpServers: config.mcpServers || {},
     agents: {},
     local: {
       cwd: workspace,
@@ -61,6 +62,48 @@ export function agentOptions(config, store, workspace = config.stateDir, customT
       enableAgentRetries: false,
     },
   };
+}
+
+function validModel(value) {
+  if (boundedString(value, 200)) return true;
+  return value && typeof value === 'object' && !Array.isArray(value) && boundedString(value.id, 200) &&
+    (value.params === undefined || Array.isArray(value.params) && value.params.length <= 16 &&
+      value.params.every((entry) => entry && typeof entry === 'object' && !Array.isArray(entry) &&
+        boundedString(entry.id, 100) && boundedString(entry.value, 100)));
+}
+
+function validMcpServers(value) {
+  if (value === undefined) return true;
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > 50) return false;
+  return Object.entries(value).every(([name, server]) => {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) || !server || typeof server !== 'object' || Array.isArray(server) ||
+        !['http', 'sse'].includes(server.type) || !boundedString(server.url, 4096)) return false;
+    try {
+      const parsed = new URL(server.url);
+      if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.hash) return false;
+    } catch { return false; }
+    return server.headers === undefined || server.headers && typeof server.headers === 'object' && !Array.isArray(server.headers) &&
+      Object.entries(server.headers).every(([key, entry]) => boundedString(key, 200) && boundedString(entry, 16384));
+  });
+}
+
+export function sanitizeModels(models) {
+  if (!Array.isArray(models) || models.length > 500) throw new WorkerError('model_catalog_invalid');
+  return models.map((model) => {
+    if (!model || !boundedString(model.id, 200) || !boundedString(model.displayName, 500)) throw new WorkerError('model_catalog_invalid');
+    const parameters = model.parameters === undefined ? [] : model.parameters.map((parameter) => {
+      if (!parameter || !boundedString(parameter.id, 100) || !Array.isArray(parameter.values) || parameter.values.length > 100) throw new WorkerError('model_catalog_invalid');
+      return { id: parameter.id, values: parameter.values.map((entry) => {
+        if (!entry || !boundedString(entry.value, 100)) throw new WorkerError('model_catalog_invalid');
+        return { value: entry.value };
+      }) };
+    });
+    const variants = model.variants === undefined ? [] : model.variants.map((variant) => {
+      if (!variant || !Array.isArray(variant.params) || variant.params.length > 16 || !variant.params.every((entry) => entry && boundedString(entry.id, 100) && boundedString(entry.value, 100))) throw new WorkerError('model_catalog_invalid');
+      return { params: variant.params.map(({ id, value }) => ({ id, value })), isDefault: variant.isDefault === true };
+    });
+    return { id: model.id, displayName: model.displayName, parameters, variants };
+  });
 }
 
 // Cursor SDK 1.0.31 scopes custom-store lookups by the explicit local.cwd.
@@ -216,9 +259,13 @@ export function createRuntime(sdk, emit, installedVersion = SDK_VERSION, injecte
     for await (const message of run.stream()) {
       if (message?.type !== 'tool_call') continue;
       const toolName = message?.args?.toolName;
-      const synthetic = message.name === 'mcp' && message?.args?.providerIdentifier === CUSTOM_TOOL_SERVER &&
+      const providerIdentifier = message?.args?.providerIdentifier;
+      const synthetic = message.name === 'mcp' && providerIdentifier === CUSTOM_TOOL_SERVER &&
         (toolName === COMMAND_TOOL || toolName === FILE_CHANGE_TOOL);
       if (synthetic) continue;
+      const configuredNative = message.name === 'mcp' && boundedString(providerIdentifier, 64) &&
+        boundedString(toolName, 512) && Object.hasOwn(config.mcpServers, providerIdentifier);
+      if (configuredNative) continue;
       throw new WorkerError('unexpected_tool_event');
     }
   }
@@ -250,16 +297,25 @@ export function createRuntime(sdk, emit, installedVersion = SDK_VERSION, injecte
 
   async function initialize(id, payload) {
 	const apiKey = process.env.CURSOR_API_KEY;
-	if (config || !payload || !boundedString(apiKey, 4096) || !boundedString(payload.model, 200) ||
+	if (config || !payload || !boundedString(apiKey, 4096) || !validModel(payload.model) || !validMcpServers(payload.mcpServers) ||
         !boundedString(payload.stateDir, 4096) || !Number.isInteger(payload.maxFrameBytes) ||
         payload.maxFrameBytes < 4096 || payload.maxFrameBytes > 8 * 1024 * 1024) {
       rejected(id);
       return;
     }
     fs.mkdirSync(payload.stateDir, { recursive: true, mode: 0o700 });
-	config = { ...payload, apiKey };
+	config = { ...payload, model: typeof payload.model === 'string' ? { id: payload.model } : payload.model, mcpServers: payload.mcpServers || {}, apiKey };
     store = new sdk.JsonlLocalAgentStore(path.join(config.stateDir, 'sdk-store'));
     response(id, { version: installedVersion });
+  }
+
+  async function models(id) {
+    if (!config || typeof sdk.Cursor?.models?.list !== 'function') {
+      rejected(id, 'model_catalog_unsupported');
+      return;
+    }
+    const result = sanitizeModels(await sdk.Cursor.models.list({ apiKey: config.apiKey }));
+    response(id, { models: result, revision: `${installedVersion}:${result.map((item) => item.id).join(',')}` });
   }
 
   async function dispatch(id, payload) {
@@ -286,7 +342,7 @@ export function createRuntime(sdk, emit, installedVersion = SDK_VERSION, injecte
       // cannot use the gated systemPrompt option. These are user-level guidance;
       // tools, inherited settings, and MCP servers remain the capability boundary.
       const prompt = `Chat guidance (user-level):\n${payload.policyContent}\n\nUser message:\n${payload.prompt}`;
-      const run = await agent.send(prompt, { model: { id: config.model }, onStep: () => {}, onDelta: () => {} });
+      const run = await agent.send(prompt, { model: config.model, mcpServers: config.mcpServers, onStep: () => {}, onDelta: () => {} });
       if (!boundedString(agent?.agentId, 512) || !boundedString(run?.id, 512)) throw new WorkerError('native_identity_invalid');
       active.set(payload.attemptKey, { agent, run });
       response(id, { agentId: agent.agentId, runId: run.id });
@@ -336,6 +392,7 @@ export function createRuntime(sdk, emit, installedVersion = SDK_VERSION, injecte
     if (frame?.type !== 'request' || !boundedString(id, 128) || !boundedString(frame.operation, 64)) return;
     try {
       if (frame.operation === 'init') await initialize(id, frame.payload);
+      else if (frame.operation === 'models') await models(id);
       else if (frame.operation === 'dispatch') await dispatch(id, frame.payload);
       else if (frame.operation === 'steer') await steer(id, frame.payload);
       else if (frame.operation === 'cancel') await cancel(id, frame.payload);

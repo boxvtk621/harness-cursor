@@ -6,6 +6,7 @@ COPY api/ api/
 COPY cmd/ cmd/
 COPY contracts/ contracts/
 COPY internal/ internal/
+COPY nodesettings/ nodesettings/
 COPY providerauth/ providerauth/
 COPY runtime/ runtime/
 COPY tools/ tools/

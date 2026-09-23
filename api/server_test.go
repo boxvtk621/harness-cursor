@@ -25,6 +25,7 @@ import (
 	"github.com/boxvtk621/harness-cursor/contracts/tooltimeline"
 	"github.com/boxvtk621/harness-cursor/contracts/transcript-view"
 	"github.com/boxvtk621/harness-cursor/contracts/wire"
+	"github.com/boxvtk621/harness-cursor/nodesettings"
 	"github.com/boxvtk621/harness-cursor/providerauth"
 	"github.com/boxvtk621/harness-cursor/runtime"
 	"github.com/boxvtk621/harness-cursor/tests/fixture"
@@ -115,6 +116,90 @@ func TestProviderAuthRoutesAreStrictAndSecretIsWriteOnly(t *testing.T) {
 	response.Body.Close()
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("unknown field status=%d", response.StatusCode)
+	}
+}
+
+func TestNodeSettingsRoutesAreStrictCASAndSecretIsWriteOnly(t *testing.T) {
+	authority, err := node.Open(context.Background(), node.Config{DataDir: t.TempDir(), NodeID: testNodeID, OwnerID: "1-1", RegistryVersion: 1, Adapter: fixture.NewAdapter(), Policies: fixture.NewPolicySource(), Space: enoughSpace{}, ManualDispatchForTesting: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer authority.Close()
+	settings, err := nodesettings.Open(testNodeID, t.TempDir(), "1.0.31", "initial-model", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := server.New(server.Config{NodeID: testNodeID, NodeSettings: settings}, authority)
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := httptest.NewServer(handler)
+	defer endpoint.Close()
+
+	response, err := http.Get(endpoint.URL + "/v1/nodes/" + testNodeID + "/settings")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(raw), `"schemaId":"harness-node-settings-v1"`) || response.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("GET settings status=%d body=%s", response.StatusCode, raw)
+	}
+
+	body := `{"expectedRevision":1,"draft":{"mcpServers":[{"id":"docs","name":"Docs","enabled":true,"transport":"streamable_http","url":"https://example.test/mcp","timeoutMs":5000,"auth":{"kind":"bearer","secretAction":"replace","secret":"write-only"}}],"inference":{"modelId":null,"speedMode":null,"reasoningEffort":null}}}`
+	request, _ := http.NewRequest(http.MethodPut, endpoint.URL+"/v1/nodes/"+testNodeID+"/settings", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || strings.Contains(string(raw), "write-only") || !strings.Contains(string(raw), `"bearerTokenConfigured":true`) || !strings.Contains(string(raw), `"modelId":null`) {
+		t.Fatalf("PUT settings status=%d body=%s", response.StatusCode, raw)
+	}
+
+	request, _ = http.NewRequest(http.MethodPut, endpoint.URL+"/v1/nodes/"+testNodeID+"/settings", strings.NewReader(strings.TrimSuffix(body, "}")+`,"unknown":true}`))
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown field status=%d", response.StatusCode)
+	}
+
+	outputField := strings.Replace(body, `"secretAction":"replace"`, `"bearerTokenConfigured":true,"secretAction":"replace"`, 1)
+	request, _ = http.NewRequest(http.MethodPut, endpoint.URL+"/v1/nodes/"+testNodeID+"/settings", strings.NewReader(outputField))
+	response, err = http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("output-only auth field status=%d", response.StatusCode)
+	}
+
+	checkBody := `{"expectedRevision":2,"mcpServerId":"docs"}`
+	response, err = http.Post(endpoint.URL+"/v1/nodes/"+testNodeID+"/settings/mcp-checks", "application/json", strings.NewReader(checkBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(raw), `"mcpServerId":"docs"`) {
+		t.Fatalf("MCP check status=%d body=%s", response.StatusCode, raw)
+	}
+
+	apply := `{"commandId":"apply-1","expectedRevision":2,"targetRevision":2}`
+	response, err = http.Post(endpoint.URL+"/v1/nodes/"+testNodeID+"/settings/apply", "application/json", strings.NewReader(apply))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusAccepted || !strings.Contains(string(raw), `"reasonCode":"managed_restart_coordination_unavailable"`) || !strings.Contains(string(raw), `"appliedRevision":1`) {
+		t.Fatalf("apply status=%d body=%s", response.StatusCode, raw)
 	}
 }
 

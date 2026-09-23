@@ -8,6 +8,7 @@ import (
 	"github.com/boxvtk621/harness-cursor/adapters/contract"
 	"github.com/boxvtk621/harness-cursor/contracts/wire"
 	"github.com/boxvtk621/harness-cursor/internal/diagnosticlog"
+	"github.com/boxvtk621/harness-cursor/nodesettings"
 	"github.com/boxvtk621/harness-cursor/runtime"
 )
 
@@ -100,6 +101,14 @@ func (managed *Managed) adapter() (*Adapter, error) {
 		return nil, errors.New("cursor provider authentication is unavailable")
 	}
 	return managed.current, nil
+}
+
+func (managed *Managed) Models(ctx context.Context) ([]nodesettings.NativeModel, string, error) {
+	adapter, err := managed.adapter()
+	if err != nil {
+		return nil, "", err
+	}
+	return adapter.Models(ctx)
 }
 
 func (managed *Managed) Identity(context.Context) (harnessadapter.Identity, error) {

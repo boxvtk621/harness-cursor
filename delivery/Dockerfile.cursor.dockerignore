@@ -18,6 +18,8 @@
 !internal/
 !internal/strictjson/
 !internal/strictjson/**
+!nodesettings/
+!nodesettings/**
 !providerauth/
 !providerauth/**
 !runtime/

@@ -18,6 +18,7 @@ import (
 	"github.com/boxvtk621/harness-cursor/contracts/wire"
 	"github.com/boxvtk621/harness-cursor/internal/diagnosticlog"
 	"github.com/boxvtk621/harness-cursor/internal/strictjson"
+	"github.com/boxvtk621/harness-cursor/nodesettings"
 	"github.com/boxvtk621/harness-cursor/providerauth"
 	"github.com/boxvtk621/harness-cursor/runtime"
 )
@@ -25,6 +26,7 @@ import (
 type Config struct {
 	NodeID       string
 	ProviderAuth providerauth.Service
+	NodeSettings nodesettings.Service
 	Diagnostics  *diagnosticlog.Logger
 }
 
@@ -48,6 +50,15 @@ func New(config Config, authority *node.Node) (http.Handler, error) {
 		mux.HandleFunc("GET /v1/provider-auth/operations/{operationId}", server.providerAuthOperation)
 		mux.HandleFunc("POST /v1/provider-auth/operations/{operationId}/cancel", server.providerAuthCancel)
 		mux.HandleFunc("POST /v1/provider-auth/logout", server.providerAuthLogout)
+	}
+	if config.NodeSettings != nil {
+		mux.HandleFunc("GET /v1/nodes/{nodeId}/settings", server.nodeSettings)
+		mux.HandleFunc("PUT /v1/nodes/{nodeId}/settings", server.putNodeSettings)
+		mux.HandleFunc("GET /v1/nodes/{nodeId}/settings/model-catalog", server.modelCatalog)
+		mux.HandleFunc("POST /v1/nodes/{nodeId}/settings/model-catalog", server.modelCatalog)
+		mux.HandleFunc("POST /v1/nodes/{nodeId}/settings/mcp-checks", server.mcpCheck)
+		mux.HandleFunc("POST /v1/nodes/{nodeId}/settings/apply", server.applyNodeSettings)
+		mux.HandleFunc("GET /v1/nodes/{nodeId}/settings/operations/{operationId}", server.nodeSettingsOperation)
 	}
 	mux.HandleFunc("GET /v1/nodes/{nodeId}/identity", server.identity)
 	mux.HandleFunc("GET /v1/nodes/{nodeId}/admission", server.admission)
@@ -76,6 +87,107 @@ func New(config Config, authority *node.Node) (http.Handler, error) {
 	mux.HandleFunc("GET /v1/nodes/{nodeId}/administration/logical-deletes/{operationId}", server.logicalDeleteStatus)
 	server.handler = mux
 	return server, nil
+}
+
+func writeNodeSettings(writer http.ResponseWriter, status int, value any, issue *nodesettings.APIError) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.Header().Set("Cache-Control", "no-store")
+	if issue != nil {
+		writer.WriteHeader(issue.Status)
+		_ = json.NewEncoder(writer).Encode(struct {
+			Code string `json:"code"`
+		}{issue.Code})
+		return
+	}
+	writer.WriteHeader(status)
+	_ = json.NewEncoder(writer).Encode(value)
+}
+
+func decodeSettingsBody(writer http.ResponseWriter, request *http.Request, target any) bool {
+	reader := http.MaxBytesReader(writer, request.Body, 1<<20)
+	raw, err := io.ReadAll(reader)
+	if err != nil || !strictjson.Valid(raw) {
+		return false
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(target) == nil && decoder.Decode(new(any)) == io.EOF
+}
+
+func (server *Server) nodeSettings(writer http.ResponseWriter, request *http.Request) {
+	if !validQuery(request) {
+		writeNodeSettings(writer, 0, nil, &nodesettings.APIError{Status: http.StatusBadRequest, Code: "invalid_request"})
+		return
+	}
+	value, issue := server.config.NodeSettings.Snapshot(request.Context(), request.PathValue("nodeId"))
+	writeNodeSettings(writer, http.StatusOK, value, issue)
+}
+
+func (server *Server) putNodeSettings(writer http.ResponseWriter, request *http.Request) {
+	if !validQuery(request) {
+		writeNodeSettings(writer, 0, nil, &nodesettings.APIError{Status: http.StatusBadRequest, Code: "invalid_request"})
+		return
+	}
+	var input nodesettings.PutRequest
+	if !decodeSettingsBody(writer, request, &input) {
+		writeNodeSettings(writer, 0, nil, &nodesettings.APIError{Status: http.StatusBadRequest, Code: "invalid_request"})
+		return
+	}
+	value, issue := server.config.NodeSettings.PutDraft(request.Context(), request.PathValue("nodeId"), input)
+	writeNodeSettings(writer, http.StatusOK, value, issue)
+}
+
+func (server *Server) modelCatalog(writer http.ResponseWriter, request *http.Request) {
+	if !validQuery(request) {
+		writeNodeSettings(writer, 0, nil, &nodesettings.APIError{Status: http.StatusBadRequest, Code: "invalid_request"})
+		return
+	}
+	if request.Method == http.MethodPost {
+		var input struct{}
+		if !decodeSettingsBody(writer, request, &input) {
+			writeNodeSettings(writer, 0, nil, &nodesettings.APIError{Status: http.StatusBadRequest, Code: "invalid_request"})
+			return
+		}
+	}
+	value, issue := server.config.NodeSettings.ModelCatalog(request.Context(), request.PathValue("nodeId"))
+	writeNodeSettings(writer, http.StatusOK, value, issue)
+}
+
+func (server *Server) mcpCheck(writer http.ResponseWriter, request *http.Request) {
+	if !validQuery(request) {
+		writeNodeSettings(writer, 0, nil, &nodesettings.APIError{Status: http.StatusBadRequest, Code: "invalid_request"})
+		return
+	}
+	var input nodesettings.MCPCheckRequest
+	if !decodeSettingsBody(writer, request, &input) {
+		writeNodeSettings(writer, 0, nil, &nodesettings.APIError{Status: http.StatusBadRequest, Code: "invalid_request"})
+		return
+	}
+	value, issue := server.config.NodeSettings.CheckMCP(request.Context(), request.PathValue("nodeId"), input)
+	writeNodeSettings(writer, http.StatusOK, value, issue)
+}
+
+func (server *Server) applyNodeSettings(writer http.ResponseWriter, request *http.Request) {
+	if !validQuery(request) {
+		writeNodeSettings(writer, 0, nil, &nodesettings.APIError{Status: http.StatusBadRequest, Code: "invalid_request"})
+		return
+	}
+	var input nodesettings.CommandRequest
+	if !decodeSettingsBody(writer, request, &input) {
+		writeNodeSettings(writer, 0, nil, &nodesettings.APIError{Status: http.StatusBadRequest, Code: "invalid_request"})
+		return
+	}
+	value, issue := server.config.NodeSettings.Apply(request.Context(), request.PathValue("nodeId"), input)
+	writeNodeSettings(writer, http.StatusAccepted, value, issue)
+}
+
+func (server *Server) nodeSettingsOperation(writer http.ResponseWriter, request *http.Request) {
+	if !validQuery(request) {
+		writeNodeSettings(writer, 0, nil, &nodesettings.APIError{Status: http.StatusBadRequest, Code: "invalid_request"})
+		return
+	}
+	value, issue := server.config.NodeSettings.Operation(request.Context(), request.PathValue("nodeId"), request.PathValue("operationId"))
+	writeNodeSettings(writer, http.StatusOK, value, issue)
 }
 
 func queryLimit(request *http.Request) (int, bool) {

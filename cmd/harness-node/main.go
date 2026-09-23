@@ -14,6 +14,7 @@ import (
 	"github.com/boxvtk621/harness-cursor/adapters/cursor"
 	harnessserver "github.com/boxvtk621/harness-cursor/api"
 	"github.com/boxvtk621/harness-cursor/internal/diagnosticlog"
+	"github.com/boxvtk621/harness-cursor/nodesettings"
 	"github.com/boxvtk621/harness-cursor/providerauth"
 	"github.com/boxvtk621/harness-cursor/runtime"
 	"github.com/boxvtk621/harness-cursor/tools"
@@ -170,7 +171,15 @@ func serve(ctx context.Context, path string, diagnostics *diagnosticlog.Logger) 
 	defer authority.Close()
 	authBackend.SetBusy(authority.Busy)
 	auth.SetTransitionGate(authority.BeginProviderAuthTransition)
-	handler, err := harnessserver.New(harnessserver.Config{NodeID: cfg.NodeID, ProviderAuth: auth, Diagnostics: diagnostics}, authority)
+	initialModel := cfg.Cursor.Model
+	if initialModel == "" {
+		initialModel = "composer-2.5"
+	}
+	settings, err := nodesettings.Open(cfg.NodeID, cfg.Cursor.StateDir, harnessadapter.CursorSDKVersion, initialModel, adapter.(nodesettings.CatalogSource))
+	if err != nil {
+		return err
+	}
+	handler, err := harnessserver.New(harnessserver.Config{NodeID: cfg.NodeID, ProviderAuth: auth, NodeSettings: settings, Diagnostics: diagnostics}, authority)
 	if err != nil {
 		return err
 	}
