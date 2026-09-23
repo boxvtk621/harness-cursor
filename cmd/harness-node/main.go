@@ -80,7 +80,7 @@ func main() {
 	diagnostics := diagnosticlog.New(os.Stderr)
 	err := serve(ctx, *path, diagnostics)
 	if err != nil {
-		diagnostics.Emit(diagnosticlog.LevelError, diagnosticlog.ComponentService, diagnosticlog.EventServiceFailed, diagnosticlog.Fields{Reason: "start_or_serve_failed"})
+		diagnostics.Emit(diagnosticlog.LevelError, diagnosticlog.ComponentService, diagnosticlog.EventServiceFailed, diagnosticlog.Fields{Reason: startupFailureReason(err)})
 	}
 	shutdown, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
 	_ = diagnostics.Shutdown(shutdown)
@@ -125,10 +125,10 @@ func loadConfig(path string) (config, error) {
 func serve(ctx context.Context, path string, diagnostics *diagnosticlog.Logger) error {
 	cfg, err := loadConfig(path)
 	if err != nil {
-		return err
+		return withStartupStage("config_load_failed", err)
 	}
 	if err := validateProviderConfig(cfg); err != nil {
-		return err
+		return withStartupStage("config_validate_failed", err)
 	}
 	if diagnostics == nil {
 		diagnostics = diagnosticlog.Disabled()
@@ -136,29 +136,29 @@ func serve(ctx context.Context, path string, diagnostics *diagnosticlog.Logger) 
 	diagnostics.SetNodeID(cfg.NodeID)
 	host, port, err := net.SplitHostPort(cfg.Listen)
 	if err != nil || net.ParseIP(host) == nil || port == "" {
-		return errors.New("explicit listen IP and port required")
+		return withStartupStage("listen_config_invalid", errors.New("explicit listen IP and port required"))
 	}
 	certificate, err := tls.LoadX509KeyPair(cfg.CertificateFile, cfg.KeyFile)
 	if err != nil {
-		return err
+		return withStartupStage("tls_certificate_load_failed", err)
 	}
 	adapterKind := selectedAdapter(cfg)
 	policies := filePolicy{contentPath: cfg.PolicyFile, manifestPath: cfg.ToolManifestFile, revision: cfg.PolicyRevision, approvalMode: cfg.ApprovalMode, adapter: adapterKind}
 	policy, err := policies.Current(ctx, cfg.NodeID)
 	if err != nil {
-		return err
+		return withStartupStage("policy_load_failed", err)
 	}
 	artifacts := node.NewArtifactIngress()
 	adapter, auth, authBackend, err := openProviderRuntime(ctx, cfg, artifacts, policy, diagnostics)
 	if err != nil {
-		return err
+		return withStartupStage("provider_runtime_open_failed", err)
 	}
 	defer adapter.Close()
 	// Establish provider truth before the node action loop can admit queued work.
 	// A transient probe failure deliberately leaves auth unknown and readiness
 	// blocked while still allowing the private auth API to recover it later.
 	if err := auth.Refresh(ctx); err != nil {
-		return err
+		return withStartupStage("provider_auth_refresh_failed", err)
 	}
 	authority, err := node.Open(ctx, node.Config{
 		DataDir: cfg.DataDir, NodeID: cfg.NodeID, OwnerID: cfg.OwnerID,
@@ -166,7 +166,7 @@ func serve(ctx context.Context, path string, diagnostics *diagnosticlog.Logger) 
 		ManualDispatchForTesting: cfg.ManualDispatchForTesting, Diagnostics: diagnostics,
 	})
 	if err != nil {
-		return err
+		return withStartupStage("runtime_open_failed", err)
 	}
 	defer authority.Close()
 	authBackend.SetBusy(authority.Busy)
@@ -177,11 +177,11 @@ func serve(ctx context.Context, path string, diagnostics *diagnosticlog.Logger) 
 	}
 	settings, err := nodesettings.Open(cfg.NodeID, cfg.Cursor.StateDir, harnessadapter.CursorSDKVersion, initialModel, adapter.(nodesettings.CatalogSource))
 	if err != nil {
-		return err
+		return withStartupStage("node_settings_open_failed", err)
 	}
 	handler, err := harnessserver.New(harnessserver.Config{NodeID: cfg.NodeID, ProviderAuth: auth, NodeSettings: settings, Diagnostics: diagnostics}, authority)
 	if err != nil {
-		return err
+		return withStartupStage("api_handler_open_failed", err)
 	}
 	server := &http.Server{
 		Addr: cfg.Listen, Handler: handler,
@@ -211,7 +211,7 @@ func serve(ctx context.Context, path string, diagnostics *diagnosticlog.Logger) 
 		diagnostics.Emit(diagnosticlog.LevelInfo, diagnosticlog.ComponentService, diagnosticlog.EventServiceStopped, diagnosticlog.Fields{})
 		return nil
 	}
-	return err
+	return withStartupStage("server_listen_failed", err)
 }
 
 func openProviderRuntime(ctx context.Context, cfg config, artifacts node.ArtifactSink, policy harnessadapter.PolicySnapshot, diagnostics *diagnosticlog.Logger) (providerAdapter, *providerauth.Manager, *cursor.AuthBackend, error) {
