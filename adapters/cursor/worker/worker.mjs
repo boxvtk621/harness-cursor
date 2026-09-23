@@ -73,7 +73,7 @@ function validModel(value) {
 }
 
 function validMcpServers(value) {
-  if (value === undefined) return true;
+  if (value === undefined || value === null) return true;
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > 50) return false;
   return Object.entries(value).every(([name, server]) => {
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) || !server || typeof server !== 'object' || Array.isArray(server) ||
