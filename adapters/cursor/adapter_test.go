@@ -86,6 +86,40 @@ func TestStartResumeAndDurablePrivateMapping(t *testing.T) {
 	}
 }
 
+func TestNewNormalizesNilModelAndMCPSettingsForWorkerInit(t *testing.T) {
+	config := fakeConfig(t)
+	config.Model = "nil-config-contract"
+	config.ModelParams = nil
+	config.MCPServers = nil
+	adapter, err := New(config, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Close()
+}
+
+func TestNewInitializesRealWorkerWithNilModelAndMCPSettings(t *testing.T) {
+	workerEntrypoint := os.Getenv("HARNESS_CURSOR_REAL_WORKER_ENTRYPOINT")
+	if workerEntrypoint == "" {
+		t.Skip("real Cursor worker entrypoint is not configured")
+	}
+	nodeExecutable, err := exec.LookPath("node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := fakeConfig(t)
+	config.NodeExecutable = nodeExecutable
+	config.WorkerEntrypoint = workerEntrypoint
+	config.Model = "composer-2.5"
+	config.ModelParams = nil
+	config.MCPServers = nil
+	adapter, err := New(config, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adapter.Close()
+}
+
 func TestResumeAcceptsExactRetryBoundaryAndRejectsConflictingReplay(t *testing.T) {
 	adapter, err := New(fakeConfig(t), nil)
 	if err != nil {
@@ -900,6 +934,10 @@ for await (const line of lines) {
   const frame = JSON.parse(line);
   const payload = frame.payload || {};
   if (frame.operation === 'init') {
+    if (payload.model?.id === 'nil-config-contract' && (!Array.isArray(payload.model.params) || !payload.mcpServers || typeof payload.mcpServers !== 'object' || Array.isArray(payload.mcpServers))) {
+      send({ type: 'response', id: frame.id, ok: false, code: 'rejected' });
+      continue;
+    }
     send({ type: 'response', id: frame.id, ok: true, result: { version: '1.0.31' } });
   } else if (frame.operation === 'dispatch') {
     if (payload.policyContent !== 'deny all tools' && payload.policyContent !== 'allow tools') {

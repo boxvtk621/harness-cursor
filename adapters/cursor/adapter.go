@@ -133,8 +133,16 @@ func New(config Config, artifacts node.ArtifactSink) (*Adapter, error) {
 	var initialized struct {
 		Version string `json:"version"`
 	}
+	modelParams := config.ModelParams
+	if modelParams == nil {
+		modelParams = []ModelParam{}
+	}
+	mcpServers := config.MCPServers
+	if mcpServers == nil {
+		mcpServers = map[string]MCPServerConfig{}
+	}
 	err = worker.call(ctx, "init", map[string]any{
-		"model": map[string]any{"id": config.Model, "params": config.ModelParams}, "mcpServers": config.MCPServers, "stateDir": config.StateDir,
+		"model": map[string]any{"id": config.Model, "params": modelParams}, "mcpServers": mcpServers, "stateDir": config.StateDir,
 		"maxFrameBytes": config.MaxFrameBytes,
 	}, &initialized)
 	if err != nil || initialized.Version != harnessadapter.CursorSDKVersion {

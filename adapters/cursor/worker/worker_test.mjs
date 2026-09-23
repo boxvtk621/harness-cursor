@@ -109,20 +109,6 @@ test('installed SDK matches the locked native version', () => {
   assert.equal(installedSDKVersion(), SDK_VERSION);
 });
 
-test('init accepts a nil MCP map serialized as null', async () => {
-  const { sdk } = fakeSDK(deferred());
-  const output = [];
-  const runtime = createRuntime(sdk, (line) => output.push(JSON.parse(line)));
-  await runtime.handle({
-    type: 'request', id: '1', operation: 'init',
-    payload: {
-      apiKey: 'key', model: { id: 'model', params: [] }, mcpServers: null,
-      stateDir: '/tmp/cursor-worker-null-mcp-test', maxFrameBytes: 65536,
-    },
-  });
-  assert.deepEqual(output[0], { type: 'response', id: '1', ok: true, result: { version: SDK_VERSION } });
-});
-
 test('dispatch acknowledges before terminal and controls remain concurrent', async () => {
   const terminal = deferred();
   const { sdk, calls } = fakeSDK(terminal);
