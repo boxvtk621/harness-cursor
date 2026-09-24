@@ -49,7 +49,11 @@ func configured(base Config, settings nodesettings.RuntimeConfig) Config {
 	}
 	base.MCPServers = make(map[string]MCPServerConfig, len(settings.MCPServers))
 	for _, server := range settings.MCPServers {
-		entry := MCPServerConfig{Type: "http", URL: server.URL}
+		nativeType := "http"
+		if server.Transport == "sse" {
+			nativeType = "sse"
+		}
+		entry := MCPServerConfig{Type: nativeType, URL: server.URL}
 		if server.BearerToken != "" {
 			entry.Headers = map[string]string{"Authorization": "Bearer " + server.BearerToken}
 		}

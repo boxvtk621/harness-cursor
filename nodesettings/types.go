@@ -7,7 +7,9 @@ import (
 	"io"
 )
 
-const SchemaID = "harness-node-settings-v1"
+const SchemaID = "harness-node-settings-v2"
+const ModelCatalogSchemaID = "harness-model-catalog-v2"
+const MCPDocumentSchemaID = "harness-mcp-document-v2"
 
 type Inference struct {
 	ModelID         *string `json:"modelId"`
@@ -24,9 +26,10 @@ type MCPAuth struct {
 
 func (auth *MCPAuth) UnmarshalJSON(raw []byte) error {
 	var input struct {
-		Kind         string `json:"kind"`
-		SecretAction string `json:"secretAction"`
-		Secret       string `json:"secret,omitempty"`
+		Kind                  string `json:"kind"`
+		SecretAction          string `json:"secretAction"`
+		Secret                string `json:"secret,omitempty"`
+		BearerTokenConfigured *bool  `json:"bearerTokenConfigured,omitempty"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
@@ -36,7 +39,16 @@ func (auth *MCPAuth) UnmarshalJSON(raw []byte) error {
 	if decoder.Decode(new(any)) != io.EOF {
 		return io.ErrUnexpectedEOF
 	}
-	*auth = MCPAuth{Kind: input.Kind, SecretAction: input.SecretAction, Secret: input.Secret}
+	action := input.SecretAction
+	if action == "" {
+		if input.Kind == "none" {
+			action = "remove"
+		}
+		if input.Kind == "bearer" && input.BearerTokenConfigured != nil && *input.BearerTokenConfigured {
+			action = "keep"
+		}
+	}
+	*auth = MCPAuth{Kind: input.Kind, SecretAction: action, Secret: input.Secret}
 	return nil
 }
 
@@ -50,18 +62,29 @@ type MCPServer struct {
 	Auth      MCPAuth `json:"auth"`
 }
 
+type MCPDocument struct {
+	SchemaID string      `json:"schemaId"`
+	Servers  []MCPServer `json:"servers"`
+}
+
 type Snapshot struct {
-	MCPServers []MCPServer `json:"mcpServers"`
-	Inference  Inference   `json:"inference"`
+	Inference   Inference   `json:"inference"`
+	MCPDocument MCPDocument `json:"mcpDocument"`
+	// MCPServers accepts the v1 request shape during migration.
+	MCPServers []MCPServer `json:"mcpServers,omitempty"`
 }
 
 type Capabilities struct {
-	Provider      string `json:"provider"`
-	ModelCatalog  string `json:"modelCatalog"`
-	ModelDefault  string `json:"modelDefault"`
-	MCPCheck      string `json:"mcpCheck"`
-	MCPTimeout    string `json:"mcpTimeout"`
-	NativeRestart string `json:"nativeRestart"`
+	Provider         string   `json:"provider"`
+	ModelCatalog     string   `json:"modelCatalog"`
+	ModelDefault     string   `json:"modelDefault"`
+	SpeedDefault     string   `json:"speedDefault"`
+	ReasoningDefault string   `json:"reasoningDefault"`
+	MCPCheck         string   `json:"mcpCheck"`
+	MCPTimeout       string   `json:"mcpTimeout"`
+	NativeRestart    string   `json:"nativeRestart"`
+	MCPSchema        string   `json:"mcpSchema"`
+	MCPTransports    []string `json:"mcpTransports"`
 }
 
 type Observation struct {
@@ -126,11 +149,18 @@ type Mode struct {
 }
 
 type Model struct {
-	ID               string `json:"id"`
-	DisplayName      string `json:"displayName"`
-	ToolCalling      *bool  `json:"toolCalling,omitempty"`
-	ReasoningEfforts []Mode `json:"reasoningEfforts"`
-	SpeedModes       []Mode `json:"speedModes"`
+	ID               string        `json:"id"`
+	DisplayName      string        `json:"displayName"`
+	ToolCalling      *bool         `json:"toolCalling,omitempty"`
+	ReasoningEfforts []Mode        `json:"reasoningEfforts"`
+	SpeedModes       []Mode        `json:"speedModes"`
+	Combinations     []Combination `json:"combinations"`
+}
+
+type Combination struct {
+	SpeedMode       *string `json:"speedMode"`
+	ReasoningEffort *string `json:"reasoningEffort"`
+	IsDefault       bool    `json:"isDefault,omitempty"`
 }
 
 type Catalog struct {
@@ -171,7 +201,7 @@ type RuntimeConfig struct {
 }
 
 type RuntimeMCPServer struct {
-	ID, URL, BearerToken string
+	ID, Transport, URL, BearerToken string
 }
 
 type RuntimeApplier interface {
@@ -185,6 +215,18 @@ type CatalogSource interface {
 type APIError struct {
 	Status int
 	Code   string
+	Path   string
+}
+
+type ValidationError struct {
+	Path string `json:"path"`
+	Code string `json:"code"`
+}
+
+type MCPValidation struct {
+	SchemaID string            `json:"schemaId"`
+	Valid    bool              `json:"valid"`
+	Errors   []ValidationError `json:"errors"`
 }
 
 type Service interface {

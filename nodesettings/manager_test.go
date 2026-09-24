@@ -37,7 +37,7 @@ func TestDraftCASMasksAndPersistsBearerSecret(t *testing.T) {
 	if issue != nil {
 		t.Fatalf("put issue=%+v", issue)
 	}
-	if envelope.DraftRevision != 2 || envelope.AppliedRevision != 1 || envelope.Draft.MCPServers[0].Auth.Secret != "" || !envelope.Draft.MCPServers[0].Auth.BearerTokenConfigured {
+	if envelope.DraftRevision != 2 || envelope.AppliedRevision != 1 || envelope.Draft.MCPDocument.Servers[0].Auth.Secret != "" || !envelope.Draft.MCPDocument.Servers[0].Auth.BearerTokenConfigured {
 		t.Fatalf("unexpected envelope: %+v", envelope)
 	}
 	if _, issue := manager.PutDraft(context.Background(), testNodeID, PutRequest{ExpectedRevision: 1, Draft: draft}); issue == nil || issue.Code != "revision_conflict" {
@@ -52,7 +52,7 @@ func TestDraftCASMasksAndPersistsBearerSecret(t *testing.T) {
 		t.Fatal(err)
 	}
 	loaded, issue := reopened.Snapshot(context.Background(), testNodeID)
-	if issue != nil || loaded.DraftRevision != 2 || !loaded.Draft.MCPServers[0].Auth.BearerTokenConfigured || loaded.Draft.MCPServers[0].Auth.Secret != "" {
+	if issue != nil || loaded.DraftRevision != 2 || !loaded.Draft.MCPDocument.Servers[0].Auth.BearerTokenConfigured || loaded.Draft.MCPDocument.Servers[0].Auth.Secret != "" {
 		t.Fatalf("reopened=%+v issue=%+v", loaded, issue)
 	}
 }
@@ -63,12 +63,23 @@ func TestCatalogMapsOnlyExplicitSemanticParameters(t *testing.T) {
 		t.Fatal(err)
 	}
 	catalog, issue := manager.ModelCatalog(context.Background(), testNodeID)
-	if issue != nil || catalog.State != "fresh" || catalog.CatalogRevision != "sdk-revision" || len(catalog.Models) != 1 {
+	if issue != nil || catalog.SchemaID != ModelCatalogSchemaID || catalog.State != "fresh" || catalog.CatalogRevision != "sdk-revision" || len(catalog.Models) != 1 {
 		t.Fatalf("catalog=%+v issue=%+v", catalog, issue)
 	}
 	model := catalog.Models[0]
-	if len(model.SpeedModes) != 1 || model.SpeedModes[0].ID != "false" || len(model.ReasoningEfforts) != 1 || model.ReasoningEfforts[0].ID != "high" {
+	if len(model.SpeedModes) != 1 || model.SpeedModes[0].ID != "off" || len(model.ReasoningEfforts) != 1 || model.ReasoningEfforts[0].ID != "high" {
 		t.Fatalf("model mapping=%+v", model)
+	}
+}
+
+func TestUnavailableCatalogUsesCatalogSchema(t *testing.T) {
+	manager, err := Open(testNodeID, t.TempDir(), "1.0.31", "initial", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, issue := manager.ModelCatalog(context.Background(), testNodeID)
+	if issue != nil || catalog.SchemaID != ModelCatalogSchemaID || catalog.State != "unavailable" || catalog.ReasonCode != "provider_auth_required" {
+		t.Fatalf("catalog=%+v issue=%+v", catalog, issue)
 	}
 }
 
@@ -119,7 +130,7 @@ func TestApplyIsDurableIdempotentAndUsesPrivateSettings(t *testing.T) {
 		t.Fatalf("envelope=%+v issue=%+v", envelope, issue)
 	}
 	finished := waitOperation(t, manager, envelope.Operation.OperationID)
-	if finished.Operation.Status != "succeeded" || finished.AppliedRevision != 2 || finished.Applied.MCPServers[0].Auth.Secret != "" {
+	if finished.Operation.Status != "succeeded" || finished.AppliedRevision != 2 || finished.Applied.MCPDocument.Servers[0].Auth.Secret != "" {
 		t.Fatalf("finished=%+v", finished)
 	}
 	readback, issue := manager.Snapshot(context.Background(), testNodeID)
@@ -257,7 +268,7 @@ func TestLegacyOperationWithoutTargetPreservesDevStateAndReplay(t *testing.T) {
 				t.Fatal(err)
 			}
 			read, issue := reopened.Snapshot(context.Background(), testNodeID)
-			if issue != nil || read.DraftRevision != 2 || read.AppliedRevision != 1 || *read.Applied.Inference.ModelID != "composer-2.5" || !read.Draft.MCPServers[0].Auth.BearerTokenConfigured {
+			if issue != nil || read.DraftRevision != 2 || read.AppliedRevision != 1 || *read.Applied.Inference.ModelID != "composer-2.5" || !read.Draft.MCPDocument.Servers[0].Auth.BearerTokenConfigured {
 				t.Fatalf("legacy read=%+v issue=%+v", read, issue)
 			}
 			if read.Operation == nil || read.Operation.OperationID != operation.OperationID || read.Operation.Status != "failed" {

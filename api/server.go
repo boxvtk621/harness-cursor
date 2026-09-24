@@ -57,6 +57,7 @@ func New(config Config, authority *node.Node) (http.Handler, error) {
 		mux.HandleFunc("GET /v1/nodes/{nodeId}/settings/model-catalog", server.modelCatalog)
 		mux.HandleFunc("POST /v1/nodes/{nodeId}/settings/model-catalog", server.modelCatalog)
 		mux.HandleFunc("POST /v1/nodes/{nodeId}/settings/mcp-checks", server.mcpCheck)
+		mux.HandleFunc("POST /v1/nodes/{nodeId}/settings/mcp-validate", server.mcpValidate)
 		mux.HandleFunc("POST /v1/nodes/{nodeId}/settings/apply", server.applyNodeSettings)
 		mux.HandleFunc("GET /v1/nodes/{nodeId}/settings/operations/{operationId}", server.nodeSettingsOperation)
 	}
@@ -96,7 +97,8 @@ func writeNodeSettings(writer http.ResponseWriter, status int, value any, issue 
 		writer.WriteHeader(issue.Status)
 		_ = json.NewEncoder(writer).Encode(struct {
 			Code string `json:"code"`
-		}{issue.Code})
+			Path string `json:"path,omitempty"`
+		}{issue.Code, issue.Path})
 		return
 	}
 	writer.WriteHeader(status)
@@ -128,13 +130,53 @@ func (server *Server) putNodeSettings(writer http.ResponseWriter, request *http.
 		writeNodeSettings(writer, 0, nil, &nodesettings.APIError{Status: http.StatusBadRequest, Code: "invalid_request"})
 		return
 	}
+	raw, err := io.ReadAll(http.MaxBytesReader(writer, request.Body, 1<<20))
+	if err != nil || !strictjson.Valid(raw) {
+		writeNodeSettings(writer, 0, nil, &nodesettings.APIError{Status: http.StatusBadRequest, Code: "invalid_request"})
+		return
+	}
+	if issues := nodesettings.ValidatePutJSON(raw); len(issues) != 0 {
+		writeNodeSettings(writer, 0, nil, &nodesettings.APIError{Status: http.StatusBadRequest, Code: issues[0].Code, Path: issues[0].Path})
+		return
+	}
 	var input nodesettings.PutRequest
-	if !decodeSettingsBody(writer, request, &input) {
+	if json.Unmarshal(raw, &input) != nil {
 		writeNodeSettings(writer, 0, nil, &nodesettings.APIError{Status: http.StatusBadRequest, Code: "invalid_request"})
 		return
 	}
 	value, issue := server.config.NodeSettings.PutDraft(request.Context(), request.PathValue("nodeId"), input)
 	writeNodeSettings(writer, http.StatusOK, value, issue)
+}
+
+func (server *Server) mcpValidate(writer http.ResponseWriter, request *http.Request) {
+	if !validQuery(request) || request.PathValue("nodeId") != server.config.NodeID {
+		writeNodeSettings(writer, 0, nil, &nodesettings.APIError{Status: http.StatusBadRequest, Code: "invalid_request"})
+		return
+	}
+	raw, err := io.ReadAll(http.MaxBytesReader(writer, request.Body, 1<<20))
+	if err != nil || !strictjson.Valid(raw) {
+		writeNodeSettings(writer, 0, nil, &nodesettings.APIError{Status: http.StatusBadRequest, Code: "invalid_request"})
+		return
+	}
+	var body map[string]json.RawMessage
+	if json.Unmarshal(raw, &body) != nil || body == nil {
+		writeNodeSettings(writer, 0, nil, &nodesettings.APIError{Status: http.StatusBadRequest, Code: "invalid_request"})
+		return
+	}
+	result := nodesettings.MCPValidation{SchemaID: "harness-mcp-validation-v2", Errors: []nodesettings.ValidationError{}}
+	for key := range body {
+		if key != "mcpDocument" {
+			result.Errors = append(result.Errors, nodesettings.ValidationError{Path: "/" + strings.ReplaceAll(strings.ReplaceAll(key, "~", "~0"), "/", "~1"), Code: "unknown_field"})
+		}
+	}
+	if document, ok := body["mcpDocument"]; ok {
+		validated := nodesettings.ValidateMCPDocumentJSON(document)
+		result.Errors = append(result.Errors, validated.Errors...)
+	} else {
+		result.Errors = append(result.Errors, nodesettings.ValidationError{Path: "/mcpDocument", Code: "required"})
+	}
+	result.Valid = len(result.Errors) == 0
+	writeNodeSettings(writer, http.StatusOK, result, nil)
 }
 
 func (server *Server) modelCatalog(writer http.ResponseWriter, request *http.Request) {

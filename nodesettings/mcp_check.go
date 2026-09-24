@@ -24,6 +24,9 @@ type mcpRPCResponse struct {
 // probeMCP checks a draft endpoint independently of the Cursor SDK worker.
 // It says whether the endpoint answered now; it cannot prove SDK tool use.
 func probeMCP(parent context.Context, server privateMCP) (int, string) {
+	if server.Transport == "sse" {
+		return probeSSE(parent, server)
+	}
 	timeout := time.Duration(server.TimeoutMS) * time.Millisecond
 	if timeout > 30*time.Second {
 		timeout = 30 * time.Second
@@ -161,4 +164,35 @@ func probeMCP(parent context.Context, server privateMCP) (int, string) {
 		cursor = listing.NextCursor
 	}
 	return 0, "mcp_protocol_invalid"
+}
+
+func probeSSE(parent context.Context, server privateMCP) (int, string) {
+	timeout := time.Duration(server.TimeoutMS) * time.Millisecond
+	if timeout > 30*time.Second {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+	if err != nil {
+		return 0, "mcp_connect_failed"
+	}
+	request.Header.Set("Accept", "text/event-stream")
+	if server.BearerToken != "" {
+		request.Header.Set("Authorization", "Bearer "+server.BearerToken)
+	}
+	client := &http.Client{Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	response, err := client.Do(request)
+	if err != nil {
+		return 0, "mcp_connect_failed"
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		return 0, "mcp_connect_failed"
+	}
+	mediaType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
+	if mediaType != "text/event-stream" {
+		return 0, "mcp_protocol_invalid"
+	}
+	return 0, ""
 }

@@ -101,6 +101,14 @@ Diagnostics contain only allowlisted lifecycle event names, mandatory `nodeId`, 
 
 The shared catalogue covers service and recovery lifecycle, runtime open/recovery/close, provider process ready/exit, accepted/rejected/deduplicated commands, attempt dispatch/start/terminal/unknown, tool start/completion, provider-auth and readiness states observed at API boundaries, and bounded logger-loss summaries. These API events report observed state and are not a second authoritative state machine. Poll reads, streaming deltas, prompts, provider frames, tool output, and other high-frequency or sensitive data are deliberately excluded.
 
+## Node settings
+
+`GET /v1/nodes/{nodeId}/settings` returns `harness-node-settings-v2`. Both `draft` and `applied` contain `inference` and `mcpDocument` (`harness-mcp-document-v2`). A full draft is saved with `PUT /v1/nodes/{nodeId}/settings` and `expectedRevision`; `POST .../apply` keeps its separate command receipt. Cursor reports `mcpSchema`, supported transports (`streamable_http`, `sse`), `modelDefault: unsupported`, `speedDefault: supported`, and `reasoningDefault: supported` in capabilities. Null speed or reasoning inherits the selected model's default variant. Public speed values `off` and `on` map to native `fast=false` and `fast=true`. The model catalog includes exact `combinations` of speed and reasoning values from the pinned SDK; apply checks the complete effective tuple.
+
+`POST /v1/nodes/{nodeId}/settings/mcp-validate` accepts `{ "mcpDocument": { ... } }` and returns `harness-mcp-validation-v2` with `valid` and JSON Pointer `errors`. It neither saves the document nor contacts MCP servers. Saved endpoint connectivity is checked separately with `POST .../mcp-checks` using `expectedRevision` and `mcpServerId`. Bearer secrets are write-only: use `replace` with a new secret, `keep` for the same server ID, or `remove`; GET exposes only `bearerTokenConfigured`. Existing private v1 HTTP entries and secret slots are retained when the node opens its persisted state.
+
+The pinned Cursor worker accepts HTTP and SSE MCP configurations, with URL and optional bearer header. It has no stdio MCP configuration or native per-server timeout. Enabled servers therefore require the standard 30-second timeout metadata at apply. Settings are supplied on native agent create, resume, and send.
+
 ## Provider authentication
 
 The provider-neutral API is described by `contracts/provider-auth-v1.schema.json`. Cursor declares only the `secret` method. `POST /v1/provider-auth/operations` accepts the write-only secret, validates it with the pinned SDK's `Cursor.me()` account call, and supplies it to the SDK only as `CURSOR_API_KEY`. This check does not create an agent or make a model request. `GET /v1/provider-auth?nodeId=<uuid>` never returns the secret or an account identifier.

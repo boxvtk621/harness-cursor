@@ -188,6 +188,19 @@ test('native MCP and model parameters are reapplied on resume and send', async (
   terminal.resolve({ status: 'finished', result: 'done' });
 });
 
+test('new native agent receives model speed and reasoning on create and send', async () => {
+  const terminal = deferred();
+  const { sdk, calls } = fakeSDK(terminal);
+  const runtime = createRuntime(sdk, () => {});
+  const model = { id: 'catalog-model', params: [{ id: 'fast', value: 'false' }, { id: 'reasoning_effort', value: 'high' }] };
+  await runtime.handle({ type: 'request', id: '1', operation: 'init', payload: { model, mcpServers: {}, stateDir: '/tmp/cursor-worker-new-mode-test', maxFrameBytes: 65536 } });
+  await runtime.handle({ type: 'request', id: '2', operation: 'dispatch', payload: { attemptKey: 'new-attempt', prompt: 'next', policyContent: 'policy', workspace: '/workspace/dialog', approvalMode: 'deny', resumeAgentId: '' } });
+  assert.equal(calls[0][0], 'create');
+  assert.deepEqual(calls[0][1].model, model);
+  assert.deepEqual(calls[1][2].model, model);
+  terminal.resolve({ status: 'finished', result: 'done' });
+});
+
 test('configured native MCP tool events are consumed without failing the run', async () => {
   const terminal = deferred();
   const { sdk } = fakeSDK(terminal, [{ type: 'tool_call', name: 'mcp', args: { providerIdentifier: 'docs', toolName: 'search' } }]);

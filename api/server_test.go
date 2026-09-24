@@ -142,7 +142,7 @@ func TestNodeSettingsRoutesAreStrictCASAndSecretIsWriteOnly(t *testing.T) {
 	}
 	raw, _ := io.ReadAll(response.Body)
 	response.Body.Close()
-	if response.StatusCode != http.StatusOK || !strings.Contains(string(raw), `"schemaId":"harness-node-settings-v1"`) || response.Header.Get("Cache-Control") != "no-store" {
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(raw), `"schemaId":"harness-node-settings-v2"`) || response.Header.Get("Cache-Control") != "no-store" {
 		t.Fatalf("GET settings status=%d body=%s", response.StatusCode, raw)
 	}
 
@@ -176,8 +176,19 @@ func TestNodeSettingsRoutesAreStrictCASAndSecretIsWriteOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	if response.StatusCode != http.StatusBadRequest {
-		t.Fatalf("output-only auth field status=%d", response.StatusCode)
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("stale auth update status=%d", response.StatusCode)
+	}
+
+	validationBody := `{"mcpDocument":{"schemaId":"harness-mcp-document-v2","servers":[{"id":"docs","name":"Docs","enabled":true,"transport":"stdio","url":"https://example.test/mcp","timeoutMs":30000,"auth":{"kind":"none","secretAction":"remove"}}]}}`
+	response, err = http.Post(endpoint.URL+"/v1/nodes/"+testNodeID+"/settings/mcp-validate", "application/json", strings.NewReader(validationBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = io.ReadAll(response.Body)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(raw), `"valid":false`) || !strings.Contains(string(raw), `"path":"/mcpDocument/servers/0/transport"`) {
+		t.Fatalf("validation status=%d body=%s", response.StatusCode, raw)
 	}
 
 	checkBody := `{"expectedRevision":2,"mcpServerId":"docs"}`

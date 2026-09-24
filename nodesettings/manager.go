@@ -84,6 +84,12 @@ func Open(nodeID, stateDir, runtimeVersion, initialModel string, source CatalogS
 			return nil, errors.New("node settings state is invalid")
 		}
 		manager.state = loaded
+		migrateInference(&manager.state.Draft.Inference)
+		migrateInference(&manager.state.Applied.Inference)
+		for id, record := range manager.state.Operations {
+			migrateInference(&record.Target.Inference)
+			manager.state.Operations[id] = record
+		}
 		// The child is recreated from Applied on startup. A pending operation
 		// may have crossed any restart boundary and must never be replayed.
 		for id, record := range manager.state.Operations {
@@ -126,14 +132,14 @@ func runtimeConfig(snapshot privateSnapshot) RuntimeConfig {
 		result.ModelID = *snapshot.Inference.ModelID
 	}
 	if snapshot.Inference.SpeedMode != nil {
-		result.Params["fast"] = *snapshot.Inference.SpeedMode
+		result.Params["fast"] = nativeSpeed(*snapshot.Inference.SpeedMode)
 	}
 	if snapshot.Inference.ReasoningEffort != nil {
 		result.Params["reasoning_effort"] = *snapshot.Inference.ReasoningEffort
 	}
 	for _, server := range snapshot.MCPServers {
 		if server.Enabled {
-			result.MCPServers = append(result.MCPServers, RuntimeMCPServer{ID: server.ID, URL: server.URL, BearerToken: server.BearerToken})
+			result.MCPServers = append(result.MCPServers, RuntimeMCPServer{ID: server.ID, Transport: server.Transport, URL: server.URL, BearerToken: server.BearerToken})
 		}
 	}
 	return result
@@ -177,7 +183,7 @@ func (manager *Manager) ModelCatalog(ctx context.Context, nodeID string) (Catalo
 		return Catalog{}, notFound()
 	}
 	stamp := manager.now().UTC().Format(time.RFC3339Nano)
-	catalog := Catalog{SchemaID: SchemaID, NodeID: nodeID, RuntimeVersion: manager.runtimeVersion, FetchedAt: stamp, State: "unavailable", Models: []Model{}}
+	catalog := Catalog{SchemaID: ModelCatalogSchemaID, NodeID: nodeID, RuntimeVersion: manager.runtimeVersion, FetchedAt: stamp, State: "unavailable", Models: []Model{}}
 	if manager.catalogSource == nil {
 		catalog.ReasonCode = "provider_auth_required"
 		return catalog, nil
@@ -189,7 +195,24 @@ func (manager *Manager) ModelCatalog(ctx context.Context, nodeID string) (Catalo
 	}
 	catalog.State, catalog.CatalogRevision = "fresh", revision
 	for _, item := range native {
-		model := Model{ID: item.ID, DisplayName: item.DisplayName, ReasoningEfforts: []Mode{}, SpeedModes: []Mode{}}
+		model := Model{ID: item.ID, DisplayName: item.DisplayName, ReasoningEfforts: []Mode{}, SpeedModes: []Mode{}, Combinations: []Combination{}}
+		for _, variant := range item.Variants {
+			combination := Combination{IsDefault: variant.IsDefault}
+			if speed, ok := variant.Params["fast"]; ok {
+				value := speed
+				if speed == "false" {
+					value = "off"
+				} else if speed == "true" {
+					value = "on"
+				}
+				combination.SpeedMode = &value
+			}
+			if effort, ok := variant.Params["reasoning_effort"]; ok {
+				value := effort
+				combination.ReasoningEffort = &value
+			}
+			model.Combinations = append(model.Combinations, combination)
+		}
 		for _, parameter := range item.Parameters {
 			if parameter.ID != "fast" && parameter.ID != "reasoning_effort" {
 				continue
@@ -201,6 +224,13 @@ func (manager *Manager) ModelCatalog(ctx context.Context, nodeID string) (Catalo
 					continue
 				}
 				seen[value] = true
+				if parameter.ID == "fast" {
+					if value == "false" {
+						value = "off"
+					} else if value == "true" {
+						value = "on"
+					}
+				}
 				mode := Mode{ID: value, IsDefault: variant.IsDefault}
 				if parameter.ID == "fast" {
 					model.SpeedModes = append(model.SpeedModes, mode)
@@ -222,6 +252,31 @@ func contains(values []string, value string) bool {
 		}
 	}
 	return false
+}
+
+func nativeSpeed(value string) string {
+	switch value {
+	case "off":
+		return "false"
+	case "on":
+		return "true"
+	default:
+		return value
+	}
+}
+
+func migrateInference(value *Inference) {
+	if value.SpeedMode == nil {
+		return
+	}
+	switch *value.SpeedMode {
+	case "false":
+		mode := "off"
+		value.SpeedMode = &mode
+	case "true":
+		mode := "on"
+		value.SpeedMode = &mode
+	}
 }
 
 func (manager *Manager) CheckMCP(ctx context.Context, nodeID string, request MCPCheckRequest) (MCPCheck, *APIError) {
@@ -250,7 +305,10 @@ func (manager *Manager) CheckMCP(ctx context.Context, nodeID string, request MCP
 	if reason != "" {
 		check.State, check.ReasonCode = "unavailable", reason
 	} else {
-		check.State, check.ToolsCount = "connected", &count
+		check.State = "connected"
+		if selected.Transport == "streamable_http" {
+			check.ToolsCount = &count
+		}
 	}
 	return check, nil
 }
@@ -398,7 +456,14 @@ func (manager *Manager) validateRuntime(ctx context.Context, target privateSnaps
 			continue
 		}
 		if len(config.Params) == 0 {
-			return nil
+			for _, variant := range model.Variants {
+				if variant.IsDefault {
+					return nil
+				}
+			}
+			if len(model.Variants) == 0 {
+				return nil
+			}
 		}
 		for paramID, value := range config.Params {
 			found := false
@@ -411,9 +476,32 @@ func (manager *Manager) validateRuntime(ctx context.Context, target privateSnaps
 				return errors.New("model_parameter_unsupported")
 			}
 		}
+		effective := make(map[string]string, len(config.Params))
+		for _, variant := range model.Variants {
+			if variant.IsDefault {
+				for key, value := range variant.Params {
+					if key == "fast" || key == "reasoning_effort" {
+						effective[key] = value
+					}
+				}
+				break
+			}
+		}
+		for key, value := range config.Params {
+			effective[key] = value
+		}
 		for _, variant := range model.Variants {
 			matches := true
-			for key, value := range config.Params {
+			semanticCount := 0
+			for key := range variant.Params {
+				if key == "fast" || key == "reasoning_effort" {
+					semanticCount++
+				}
+			}
+			if semanticCount != len(effective) {
+				matches = false
+			}
+			for key, value := range effective {
 				if variant.Params[key] != value {
 					matches = false
 				}
@@ -499,7 +587,7 @@ func validOperationPhase(value string) bool {
 
 func validPrivateSnapshot(snapshot privateSnapshot) bool {
 	if snapshot.Inference.ModelID != nil && !validText(*snapshot.Inference.ModelID, 200) || len(snapshot.MCPServers) > maximumServers ||
-		snapshot.Inference.SpeedMode != nil && !validText(*snapshot.Inference.SpeedMode, 100) ||
+		snapshot.Inference.SpeedMode != nil && !validSpeed(*snapshot.Inference.SpeedMode) ||
 		snapshot.Inference.ReasoningEffort != nil && !validText(*snapshot.Inference.ReasoningEffort, 100) {
 		return false
 	}
@@ -513,8 +601,12 @@ func validPrivateSnapshot(snapshot privateSnapshot) bool {
 	return true
 }
 
+func validSpeed(value string) bool {
+	return value == "off" || value == "on" || value == "false" || value == "true"
+}
+
 func validPrivateMCP(item privateMCP) bool {
-	if !identifierPattern.MatchString(item.ID) || !validText(item.Name, 200) || item.Transport != "streamable_http" ||
+	if !identifierPattern.MatchString(item.ID) || !validText(item.Name, 200) || item.Transport != "streamable_http" && item.Transport != "sse" ||
 		item.TimeoutMS < 100 || item.TimeoutMS > 120000 || len(item.BearerToken) > 16<<10 || strings.ContainsAny(item.BearerToken, "\r\n\x00") {
 		return false
 	}
@@ -523,19 +615,30 @@ func validPrivateMCP(item privateMCP) bool {
 }
 
 func validateDraft(input Snapshot, previous privateSnapshot) (privateSnapshot, *APIError) {
-	if input.Inference.ModelID != nil && !validText(*input.Inference.ModelID, 200) || len(input.MCPServers) > maximumServers ||
+	servers := input.MCPServers
+	if input.MCPDocument.SchemaID != "" || input.MCPDocument.Servers != nil {
+		if input.MCPDocument.SchemaID != MCPDocumentSchemaID || input.MCPServers != nil || input.MCPDocument.Servers == nil {
+			return privateSnapshot{}, invalid()
+		}
+		servers = input.MCPDocument.Servers
+	}
+	if input.Inference.ModelID != nil && !validText(*input.Inference.ModelID, 200) || len(servers) > maximumServers ||
 		input.Inference.SpeedMode != nil && !validText(*input.Inference.SpeedMode, 100) ||
 		input.Inference.ReasoningEffort != nil && !validText(*input.Inference.ReasoningEffort, 100) {
 		return privateSnapshot{}, invalid()
 	}
+	if input.Inference.SpeedMode != nil && *input.Inference.SpeedMode != "off" && *input.Inference.SpeedMode != "on" && *input.Inference.SpeedMode != "false" && *input.Inference.SpeedMode != "true" {
+		return privateSnapshot{}, invalid()
+	}
+	migrateInference(&input.Inference)
 	prior := make(map[string]privateMCP, len(previous.MCPServers))
 	for _, item := range previous.MCPServers {
 		prior[item.ID] = item
 	}
-	result := privateSnapshot{Inference: input.Inference, MCPServers: make([]privateMCP, 0, len(input.MCPServers))}
-	seen := make(map[string]bool, len(input.MCPServers))
-	for _, item := range input.MCPServers {
-		if seen[item.ID] || !identifierPattern.MatchString(item.ID) || !validText(item.Name, 200) || item.Transport != "streamable_http" || item.TimeoutMS < 100 || item.TimeoutMS > 120000 {
+	result := privateSnapshot{Inference: input.Inference, MCPServers: make([]privateMCP, 0, len(servers))}
+	seen := make(map[string]bool, len(servers))
+	for _, item := range servers {
+		if seen[item.ID] || !identifierPattern.MatchString(item.ID) || !validText(item.Name, 200) || item.Transport != "streamable_http" && item.Transport != "sse" || item.TimeoutMS < 100 || item.TimeoutMS > 120000 {
 			return privateSnapshot{}, invalid()
 		}
 		parsed, err := url.Parse(item.URL)
@@ -590,17 +693,17 @@ func (manager *Manager) envelopeLocked(operation *Operation) Envelope {
 	if manager.beginTransition != nil && manager.applier != nil {
 		restart = "supported"
 	}
-	return Envelope{SchemaID: SchemaID, NodeID: manager.nodeID, DraftRevision: manager.state.DraftRevision, AppliedRevision: manager.state.AppliedRevision, Draft: publicSnapshot(manager.state.Draft), Applied: publicSnapshot(manager.state.Applied), Capabilities: Capabilities{Provider: "cursor", ModelCatalog: state, ModelDefault: "unsupported", MCPCheck: "supported", MCPTimeout: "unsupported", NativeRestart: restart}, Operation: operation}
+	return Envelope{SchemaID: SchemaID, NodeID: manager.nodeID, DraftRevision: manager.state.DraftRevision, AppliedRevision: manager.state.AppliedRevision, Draft: publicSnapshot(manager.state.Draft), Applied: publicSnapshot(manager.state.Applied), Capabilities: Capabilities{Provider: "cursor", ModelCatalog: state, ModelDefault: "unsupported", SpeedDefault: "supported", ReasoningDefault: "supported", MCPCheck: "supported", MCPTimeout: "unsupported", NativeRestart: restart, MCPSchema: MCPDocumentSchemaID, MCPTransports: []string{"streamable_http", "sse"}}, Operation: operation}
 }
 
 func publicSnapshot(input privateSnapshot) Snapshot {
-	output := Snapshot{Inference: input.Inference, MCPServers: make([]MCPServer, 0, len(input.MCPServers))}
+	output := Snapshot{Inference: input.Inference, MCPDocument: MCPDocument{SchemaID: MCPDocumentSchemaID, Servers: make([]MCPServer, 0, len(input.MCPServers))}}
 	for _, item := range input.MCPServers {
 		kind := "none"
 		if item.BearerToken != "" {
 			kind = "bearer"
 		}
-		output.MCPServers = append(output.MCPServers, MCPServer{ID: item.ID, Name: item.Name, Enabled: item.Enabled, Transport: item.Transport, URL: item.URL, TimeoutMS: item.TimeoutMS, Auth: MCPAuth{Kind: kind, BearerTokenConfigured: item.BearerToken != ""}})
+		output.MCPDocument.Servers = append(output.MCPDocument.Servers, MCPServer{ID: item.ID, Name: item.Name, Enabled: item.Enabled, Transport: item.Transport, URL: item.URL, TimeoutMS: item.TimeoutMS, Auth: MCPAuth{Kind: kind, BearerTokenConfigured: item.BearerToken != ""}})
 	}
 	return output
 }
